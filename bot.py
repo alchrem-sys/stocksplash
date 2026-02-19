@@ -1,9 +1,10 @@
 """
 MEXC Futures Price Surge Monitor Bot
-Version: 6.0.0 — Freeze / Ban / Unban controls
+Version: 7.0.0 — Multi-user subscriber system
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -34,19 +35,14 @@ logging.basicConfig(
 logger = logging.getLogger("mexc_surge_bot")
 
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
-CHAT_ID: str = os.getenv("CHAT_ID", "")
-
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing from .env file")
-if not CHAT_ID:
-    raise RuntimeError("CHAT_ID is missing from .env file")
 
 FETCH_INTERVAL: float = float(os.getenv("FETCH_INTERVAL", "2"))
 SURGE_THRESHOLD: float = float(os.getenv("SURGE_THRESHOLD", "1.0"))
 WINDOW_SECONDS: int = int(os.getenv("WINDOW_SECONDS", "60"))
 COOLDOWN_SECONDS: int = int(os.getenv("COOLDOWN_SECONDS", "60"))
 
-# Only this Telegram user ID can use control commands
 ADMIN_ID = 868931721
 
 MEXC_TICKER_URL = "https://futures.mexc.com/api/v1/contract/ticker"
@@ -78,6 +74,35 @@ TARGET_BASE_NAMES = [
 ]
 
 # ---------------------------------------------------------------------------
+# Persistent subscriber storage
+# ---------------------------------------------------------------------------
+
+SUBSCRIBERS_FILE = Path(__file__).parent / "subscribers.json"
+
+
+def load_subscribers() -> dict[int, dict]:
+    """Load subscribers from disk. Format: {chat_id: {name, username, joined_at}}"""
+    if SUBSCRIBERS_FILE.exists():
+        try:
+            data = json.loads(SUBSCRIBERS_FILE.read_text())
+            return {int(k): v for k, v in data.items()}
+        except Exception as exc:
+            logger.error("Failed to load subscribers: %s", exc)
+    return {}
+
+
+def save_subscribers() -> None:
+    """Persist subscribers to disk."""
+    try:
+        SUBSCRIBERS_FILE.write_text(json.dumps(subscribers, indent=2))
+    except Exception as exc:
+        logger.error("Failed to save subscribers: %s", exc)
+
+
+# chat_id -> {name, username, joined_at}
+subscribers: dict[int, dict] = load_subscribers()
+
+# ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 
@@ -87,11 +112,7 @@ last_alert_time: dict[str, float] = {}
 symbols_discovered: bool = False
 test_mode: bool = False
 test_chat_id: Optional[int] = None
-
-# symbol -> permanently banned (no alerts ever)
 banned_symbols: set[str] = set()
-
-# symbol -> unfreeze timestamp (alerts paused until that time)
 frozen_symbols: dict[str, float] = {}
 
 # ---------------------------------------------------------------------------
@@ -108,10 +129,6 @@ async def deny(message: Message) -> None:
 
 
 def normalize_input(raw: str) -> str:
-    """
-    Accept any user input format and return the MEXC symbol style.
-    Examples: tsla -> TSLA, TSLA_USDT -> TSLA_USDT, tslausdt -> TSLA_USDT
-    """
     s = raw.upper().strip()
     if "_" not in s:
         if s.endswith("USDT"):
@@ -124,11 +141,9 @@ def normalize_input(raw: str) -> str:
 
 
 def find_symbol(user_input: str) -> Optional[str]:
-    """Return the matching monitored symbol or None."""
     normalized = normalize_input(user_input)
     if normalized in MONITORED_SYMBOLS:
         return normalized
-    # Fallback: match by base name substring
     base = normalized.split("_")[0]
     for sym in MONITORED_SYMBOLS:
         if sym.startswith(base + "_"):
@@ -151,6 +166,39 @@ def symbol_status(sym: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Broadcast to all subscribers
+# ---------------------------------------------------------------------------
+
+
+async def broadcast(bot: Bot, text: str, keyboard: InlineKeyboardMarkup) -> None:
+    """Send alert to every subscriber. Remove dead chat IDs automatically."""
+    dead: list[int] = []
+
+    for chat_id in list(subscribers.keys()):
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=keyboard,
+            )
+            await asyncio.sleep(0.05)  # Respect Telegram rate limits
+        except Exception as exc:
+            err = str(exc).lower()
+            # User blocked the bot or deleted their account
+            if "blocked" in err or "not found" in err or "deactivated" in err:
+                logger.warning("Removing dead subscriber %d: %s", chat_id, exc)
+                dead.append(chat_id)
+            else:
+                logger.error("Failed to send to %d: %s", chat_id, exc)
+
+    if dead:
+        for chat_id in dead:
+            subscribers.pop(chat_id, None)
+        save_subscribers()
+        logger.info("Removed %d dead subscribers", len(dead))
+
+
+# ---------------------------------------------------------------------------
 # Symbol discovery
 # ---------------------------------------------------------------------------
 
@@ -158,35 +206,28 @@ def symbol_status(sym: str) -> str:
 def discover_symbols(all_tickers: list[dict]) -> tuple[dict[str, str], list[str]]:
     api_symbols: list[str] = [t.get("symbol", "") for t in all_tickers]
     api_symbol_set = set(api_symbols)
-
     found: dict[str, str] = {}
     not_found: list[str] = []
 
     for base in TARGET_BASE_NAMES:
         match = None
-
         for suffix in ("_USDT", "_USDC"):
-            candidate = f"{base}{suffix}"
-            if candidate in api_symbol_set:
-                match = candidate
+            if f"{base}{suffix}" in api_symbol_set:
+                match = f"{base}{suffix}"
                 break
-
         if not match:
             for sym in api_symbols:
                 if sym.split("_")[0].upper() == base.upper():
                     match = sym
                     break
-
         if not match:
-            candidates = [
-                sym for sym in api_symbols
-                if base.upper() in sym.upper()
-                and ("USDT" in sym or "USDC" in sym)
-            ]
-            candidates.sort(key=len)
+            candidates = sorted(
+                [s for s in api_symbols if base.upper() in s.upper()
+                 and ("USDT" in s or "USDC" in s)],
+                key=len
+            )
             if candidates:
                 match = candidates[0]
-
         if match:
             found[match] = base
             logger.info("Matched: %-10s -> %s", base, match)
@@ -205,226 +246,232 @@ router = Router()
 
 
 # ---------------------------------------------------------------------------
-# /start
+# /start — subscribe
 # ---------------------------------------------------------------------------
 
 @router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
+    user = message.from_user
+    chat_id = message.chat.id
+
+    already = chat_id in subscribers
+
+    # Register subscriber
+    subscribers[chat_id] = {
+        "name": user.full_name if user else "Unknown",
+        "username": f"@{user.username}" if user and user.username else "no username",
+        "joined_at": subscribers.get(chat_id, {}).get("joined_at", time.time()),
+    }
+    save_subscribers()
+
+    if not already:
+        logger.info(
+            "New subscriber: %s (%s) id=%d",
+            subscribers[chat_id]["name"],
+            subscribers[chat_id]["username"],
+            chat_id,
+        )
+        # Notify admin about new subscriber
+        try:
+            await message.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    f"🆕 <b>New subscriber!</b>\n\n"
+                    f"👤 Name: <b>{subscribers[chat_id]['name']}</b>\n"
+                    f"🔗 Username: {subscribers[chat_id]['username']}\n"
+                    f"🆔 ID: <code>{chat_id}</code>\n"
+                    f"👥 Total subscribers: <b>{len(subscribers)}</b>"
+                ),
+            )
+        except Exception:
+            pass
+
     status = (
         f"📡 Watching <b>{len(MONITORED_SYMBOLS)}</b> symbols"
         if symbols_discovered
-        else "⏳ Discovering symbols..."
+        else "📡 Starting up, discovering symbols..."
     )
-    admin_hint = "\n\n<b>Admin commands:</b>\n/ban TSLA — permanently silence a ticker\n/freeze TSLA 30 — silence for N minutes\n/unban TSLA — restore a banned ticker\n/unfreeze TSLA — restore a frozen ticker\n/blocked — show banned + frozen list" if message.from_user and message.from_user.id == ADMIN_ID else ""
+
+    verb = "You're already subscribed" if already else "You're now subscribed"
+
     await message.answer(
-        f"👋 <b>MEXC Surge Monitor is running!</b>\n\n"
+        f"👋 <b>Welcome to MEXC Surge Monitor!</b>\n\n"
+        f"✅ {verb} to price surge alerts.\n\n"
         f"{status}\n"
-        f"🚨 Alerts at <b>+{SURGE_THRESHOLD}%</b> within <b>{WINDOW_SECONDS}s</b>\n"
-        f"🔕 Cooldown: <b>{COOLDOWN_SECONDS}s</b>\n\n"
+        f"🚨 Alerts fire at <b>+{SURGE_THRESHOLD}%</b> within <b>{WINDOW_SECONDS}s</b>\n\n"
         "<b>Commands:</b>\n"
-        "/status — live stats + top 5 movers\n"
-        "/symbols — all matched symbols\n"
-        "/test — one-time scan at 0.1%\n"
-        "/debug — API diagnostic"
-        f"{admin_hint}"
+        "/status — live stats + top movers\n"
+        "/stop — unsubscribe from alerts\n"
+        "/test — test alert at 0.1% threshold\n"
     )
 
 
 # ---------------------------------------------------------------------------
-# /ban  — permanently silence a symbol
-# Usage: /ban TSLA   or   /ban TSLA_USDT
+# /stop — unsubscribe
 # ---------------------------------------------------------------------------
 
-@router.message(Command("ban"))
-async def cmd_ban(message: Message) -> None:
+@router.message(Command("stop"))
+async def cmd_stop(message: Message) -> None:
+    chat_id = message.chat.id
+
+    if chat_id not in subscribers:
+        await message.answer("ℹ️ You are not subscribed. Send /start to subscribe.")
+        return
+
+    name = subscribers[chat_id]["name"]
+    subscribers.pop(chat_id)
+    save_subscribers()
+    logger.info("Unsubscribed: %s id=%d", name, chat_id)
+
+    await message.answer(
+        "✅ <b>You have been unsubscribed.</b>\n\n"
+        "You will no longer receive surge alerts.\n"
+        "Send /start anytime to subscribe again."
+    )
+
+    try:
+        await message.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"👋 <b>Subscriber left</b>\n\n"
+                f"👤 {name} (id: <code>{chat_id}</code>)\n"
+                f"👥 Remaining: <b>{len(subscribers)}</b>"
+            ),
+        )
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# /subscribers — admin only
+# ---------------------------------------------------------------------------
+
+@router.message(Command("subscribers"))
+async def cmd_subscribers(message: Message) -> None:
+    if not is_admin(message):
+        await deny(message)
+        return
+
+    if not subscribers:
+        await message.answer("📭 No subscribers yet.")
+        return
+
+    lines = []
+    for i, (cid, info) in enumerate(subscribers.items(), 1):
+        joined = time.strftime("%d.%m.%Y", time.localtime(info.get("joined_at", 0)))
+        lines.append(
+            f"{i}. <b>{info['name']}</b> {info['username']}\n"
+            f"   ID: <code>{cid}</code> | joined: {joined}"
+        )
+
+    # Split into chunks if too many users
+    chunk_size = 30
+    chunks = [lines[i:i+chunk_size] for i in range(0, len(lines), chunk_size)]
+
+    for chunk in chunks:
+        await message.answer(
+            f"👥 <b>Subscribers ({len(subscribers)} total):</b>\n\n"
+            + "\n\n".join(chunk)
+        )
+
+
+# ---------------------------------------------------------------------------
+# /kick — admin removes a subscriber
+# Usage: /kick 123456789
+# ---------------------------------------------------------------------------
+
+@router.message(Command("kick"))
+async def cmd_kick(message: Message) -> None:
     if not is_admin(message):
         await deny(message)
         return
 
     args = (message.text or "").split()[1:]
     if not args:
-        await message.answer(
-            "Usage: <code>/ban SYMBOL</code>\n"
-            "Example: <code>/ban TSLA</code>\n\n"
-            "Permanently silences all alerts for that ticker.\n"
-            "Use /unban to restore."
-        )
-        return
-
-    sym = find_symbol(args[0])
-    if sym is None:
-        await message.answer(
-            f"❌ Symbol <code>{args[0].upper()}</code> not found in monitored list.\n"
-            "Send /symbols to see available tickers."
-        )
-        return
-
-    banned_symbols.add(sym)
-    frozen_symbols.pop(sym, None)  # remove freeze if any
-    logger.info("ADMIN banned symbol: %s", sym)
-    await message.answer(
-        f"🔴 <b>{sym}</b> is now <b>BANNED</b>.\n"
-        "No alerts will fire for this ticker until you use:\n"
-        f"<code>/unban {sym.split('_')[0]}</code>"
-    )
-
-
-# ---------------------------------------------------------------------------
-# /unban  — restore a banned symbol
-# ---------------------------------------------------------------------------
-
-@router.message(Command("unban"))
-async def cmd_unban(message: Message) -> None:
-    if not is_admin(message):
-        await deny(message)
-        return
-
-    args = (message.text or "").split()[1:]
-    if not args:
-        await message.answer("Usage: <code>/unban SYMBOL</code>")
-        return
-
-    sym = find_symbol(args[0])
-    if sym is None:
-        await message.answer(f"❌ Symbol <code>{args[0].upper()}</code> not found.")
-        return
-
-    if sym not in banned_symbols:
-        await message.answer(f"ℹ️ <b>{sym}</b> is not banned.")
-        return
-
-    banned_symbols.discard(sym)
-    logger.info("ADMIN unbanned symbol: %s", sym)
-    await message.answer(
-        f"✅ <b>{sym}</b> is now <b>ACTIVE</b> again.\n"
-        "Alerts will resume normally."
-    )
-
-
-# ---------------------------------------------------------------------------
-# /freeze  — silence a symbol for N minutes
-# Usage: /freeze TSLA 30
-# ---------------------------------------------------------------------------
-
-@router.message(Command("freeze"))
-async def cmd_freeze(message: Message) -> None:
-    if not is_admin(message):
-        await deny(message)
-        return
-
-    args = (message.text or "").split()[1:]
-    if len(args) < 2:
-        await message.answer(
-            "Usage: <code>/freeze SYMBOL MINUTES</code>\n"
-            "Example: <code>/freeze TSLA 30</code>\n\n"
-            "Pauses alerts for that ticker for N minutes.\n"
-            "Use /unfreeze to restore early."
-        )
-        return
-
-    sym = find_symbol(args[0])
-    if sym is None:
-        await message.answer(
-            f"❌ Symbol <code>{args[0].upper()}</code> not found.\n"
-            "Send /symbols to see available tickers."
-        )
+        await message.answer("Usage: <code>/kick CHAT_ID</code>")
         return
 
     try:
-        minutes = float(args[1])
-        if minutes <= 0:
-            raise ValueError
+        target_id = int(args[0])
     except ValueError:
-        await message.answer("❌ Minutes must be a positive number. Example: <code>/freeze TSLA 30</code>")
+        await message.answer("❌ Invalid ID. Must be a number.")
         return
 
-    unfreeze_at = time.time() + minutes * 60
-    frozen_symbols[sym] = unfreeze_at
-    logger.info("ADMIN froze symbol: %s for %.1f minutes", sym, minutes)
+    if target_id not in subscribers:
+        await message.answer(f"ℹ️ ID <code>{target_id}</code> is not subscribed.")
+        return
 
-    hours = int(minutes // 60)
-    mins = int(minutes % 60)
-    duration_str = f"{hours}h {mins}m" if hours else f"{mins}m"
+    name = subscribers[target_id]["name"]
+    subscribers.pop(target_id)
+    save_subscribers()
 
     await message.answer(
-        f"🟡 <b>{sym}</b> is now <b>FROZEN</b> for <b>{duration_str}</b>.\n"
-        "No alerts will fire during this period.\n\n"
-        f"Resumes automatically, or use:\n"
-        f"<code>/unfreeze {sym.split('_')[0]}</code>"
+        f"✅ Removed <b>{name}</b> (<code>{target_id}</code>) from subscribers."
     )
 
+    # Notify the kicked user
+    try:
+        await message.bot.send_message(
+            chat_id=target_id,
+            text="ℹ️ You have been removed from the MEXC Surge Monitor by the admin."
+        )
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------------------
-# /unfreeze  — restore a frozen symbol early
+# /broadcast — admin sends a custom message to all subscribers
+# Usage: /broadcast Your message here
 # ---------------------------------------------------------------------------
 
-@router.message(Command("unfreeze"))
-async def cmd_unfreeze(message: Message) -> None:
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message) -> None:
     if not is_admin(message):
         await deny(message)
         return
 
-    args = (message.text or "").split()[1:]
-    if not args:
-        await message.answer("Usage: <code>/unfreeze SYMBOL</code>")
+    text = (message.text or "").split(maxsplit=1)
+    if len(text) < 2:
+        await message.answer(
+            "Usage: <code>/broadcast Your message here</code>\n"
+            "Sends your message to all subscribers."
+        )
         return
 
-    sym = find_symbol(args[0])
-    if sym is None:
-        await message.answer(f"❌ Symbol <code>{args[0].upper()}</code> not found.")
-        return
-
-    if sym not in frozen_symbols:
-        await message.answer(f"ℹ️ <b>{sym}</b> is not frozen.")
-        return
-
-    frozen_symbols.pop(sym)
-    logger.info("ADMIN unfroze symbol: %s", sym)
+    msg = text[1]
     await message.answer(
-        f"✅ <b>{sym}</b> is now <b>ACTIVE</b> again.\n"
-        "Alerts will resume immediately."
+        f"📣 Sending to <b>{len(subscribers)}</b> subscribers..."
     )
 
+    sent = 0
+    failed = 0
+    dead = []
 
-# ---------------------------------------------------------------------------
-# /blocked  — show all banned and frozen symbols
-# ---------------------------------------------------------------------------
+    for chat_id in list(subscribers.keys()):
+        try:
+            await message.bot.send_message(
+                chat_id=chat_id,
+                text=f"📣 <b>Message from admin:</b>\n\n{msg}",
+            )
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception as exc:
+            err = str(exc).lower()
+            if "blocked" in err or "not found" in err or "deactivated" in err:
+                dead.append(chat_id)
+            failed += 1
 
-@router.message(Command("blocked"))
-async def cmd_blocked(message: Message) -> None:
-    if not is_admin(message):
-        await deny(message)
-        return
+    for cid in dead:
+        subscribers.pop(cid, None)
+    if dead:
+        save_subscribers()
 
-    now = time.time()
-
-    # Clean expired freezes
-    expired = [s for s, t in frozen_symbols.items() if t <= now]
-    for s in expired:
-        frozen_symbols.pop(s)
-
-    banned_text = ""
-    for sym in sorted(banned_symbols):
-        banned_text += f"  🔴 <b>{sym}</b> — permanently banned\n"
-
-    frozen_text = ""
-    for sym, until in sorted(frozen_symbols.items()):
-        remaining = until - now
-        mins = int(remaining // 60)
-        secs = int(remaining % 60)
-        frozen_text += f"  🟡 <b>{sym}</b> — {mins}m {secs}s remaining\n"
-
-    if not banned_text and not frozen_text:
-        await message.answer("✅ No symbols are currently banned or frozen.")
-        return
-
-    parts = ["🚫 <b>Blocked Symbols</b>\n"]
-    if banned_text:
-        parts.append(f"<b>Banned ({len(banned_symbols)}):</b>\n{banned_text}")
-    if frozen_text:
-        parts.append(f"<b>Frozen ({len(frozen_symbols)}):</b>\n{frozen_text}")
-
-    await message.answer("\n".join(parts))
+    await message.answer(
+        f"✅ Broadcast complete\n"
+        f"📨 Sent: <b>{sent}</b>\n"
+        f"❌ Failed: <b>{failed}</b>\n"
+        f"🗑 Removed dead: <b>{len(dead)}</b>"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -457,28 +504,159 @@ async def cmd_status(message: Message) -> None:
     top_text = ""
     for sym, pct, price in movers[:5]:
         arrow = "📈" if pct >= 0 else "📉"
-        tag = ""
-        if sym in banned_symbols:
-            tag = " 🔴"
-        elif sym in frozen_symbols and frozen_symbols[sym] > now:
-            tag = " 🟡"
+        tag = " 🔴" if sym in banned_symbols else (
+            " 🟡" if sym in frozen_symbols and frozen_symbols[sym] > now else ""
+        )
         top_text += f"  {arrow} <b>{sym}</b>{tag}: {pct:+.3f}% @ ${price:.4f}\n"
 
     if not top_text:
         top_text = "  ⏳ Filling window, wait 10s...\n"
+
+    admin_extra = (
+        f"\n👥 Subscribers: <b>{len(subscribers)}</b>\n"
+        f"🔴 Banned: <b>{len(banned_symbols)}</b>\n"
+        f"🟡 Frozen: <b>{len(frozen_symbols)}</b>"
+        if message.from_user and message.from_user.id == ADMIN_ID else ""
+    )
 
     await message.answer(
         f"📊 <b>Monitor Status</b>\n\n"
         f"🔍 Symbols matched: <b>{len(MONITORED_SYMBOLS)}</b>\n"
         f"📈 Windows with data: <b>{windows_with_data}/{len(MONITORED_SYMBOLS)}</b>\n"
         f"🔕 On cooldown: <b>{on_cooldown}</b>\n"
-        f"🔴 Banned: <b>{len(banned_symbols)}</b>\n"
-        f"🟡 Frozen: <b>{len(frozen_symbols)}</b>\n"
         f"⚡ Alert threshold: <b>{SURGE_THRESHOLD}%</b>\n"
         f"⏱ Window: <b>{WINDOW_SECONDS}s</b>\n"
-        f"🔄 Fetch interval: <b>{FETCH_INTERVAL}s</b>\n\n"
+        f"🔄 Fetch interval: <b>{FETCH_INTERVAL}s</b>"
+        f"{admin_extra}\n\n"
         f"🏆 <b>Top 5 movers right now:</b>\n{top_text}"
     )
+
+
+# ---------------------------------------------------------------------------
+# /ban /unban /freeze /unfreeze /blocked — admin symbol controls
+# ---------------------------------------------------------------------------
+
+@router.message(Command("ban"))
+async def cmd_ban(message: Message) -> None:
+    if not is_admin(message):
+        await deny(message)
+        return
+    args = (message.text or "").split()[1:]
+    if not args:
+        await message.answer("Usage: <code>/ban SYMBOL</code>  e.g. <code>/ban TSLA</code>")
+        return
+    sym = find_symbol(args[0])
+    if not sym:
+        await message.answer(f"❌ Symbol <code>{args[0].upper()}</code> not found. See /symbols")
+        return
+    banned_symbols.add(sym)
+    frozen_symbols.pop(sym, None)
+    logger.info("ADMIN banned: %s", sym)
+    await message.answer(
+        f"🔴 <b>{sym}</b> is <b>BANNED</b>.\n"
+        f"Use <code>/unban {sym.split('_')[0]}</code> to restore."
+    )
+
+
+@router.message(Command("unban"))
+async def cmd_unban(message: Message) -> None:
+    if not is_admin(message):
+        await deny(message)
+        return
+    args = (message.text or "").split()[1:]
+    if not args:
+        await message.answer("Usage: <code>/unban SYMBOL</code>")
+        return
+    sym = find_symbol(args[0])
+    if not sym:
+        await message.answer(f"❌ Symbol <code>{args[0].upper()}</code> not found.")
+        return
+    if sym not in banned_symbols:
+        await message.answer(f"ℹ️ <b>{sym}</b> is not banned.")
+        return
+    banned_symbols.discard(sym)
+    await message.answer(f"✅ <b>{sym}</b> is now <b>ACTIVE</b> again.")
+
+
+@router.message(Command("freeze"))
+async def cmd_freeze(message: Message) -> None:
+    if not is_admin(message):
+        await deny(message)
+        return
+    args = (message.text or "").split()[1:]
+    if len(args) < 2:
+        await message.answer(
+            "Usage: <code>/freeze SYMBOL MINUTES</code>\n"
+            "Example: <code>/freeze TSLA 30</code>"
+        )
+        return
+    sym = find_symbol(args[0])
+    if not sym:
+        await message.answer(f"❌ Symbol <code>{args[0].upper()}</code> not found.")
+        return
+    try:
+        minutes = float(args[1])
+        if minutes <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Minutes must be a positive number.")
+        return
+    frozen_symbols[sym] = time.time() + minutes * 60
+    hours = int(minutes // 60)
+    mins = int(minutes % 60)
+    duration_str = f"{hours}h {mins}m" if hours else f"{mins}m"
+    await message.answer(
+        f"🟡 <b>{sym}</b> frozen for <b>{duration_str}</b>.\n"
+        f"Use <code>/unfreeze {sym.split('_')[0]}</code> to restore early."
+    )
+
+
+@router.message(Command("unfreeze"))
+async def cmd_unfreeze(message: Message) -> None:
+    if not is_admin(message):
+        await deny(message)
+        return
+    args = (message.text or "").split()[1:]
+    if not args:
+        await message.answer("Usage: <code>/unfreeze SYMBOL</code>")
+        return
+    sym = find_symbol(args[0])
+    if not sym:
+        await message.answer(f"❌ Symbol <code>{args[0].upper()}</code> not found.")
+        return
+    if sym not in frozen_symbols:
+        await message.answer(f"ℹ️ <b>{sym}</b> is not frozen.")
+        return
+    frozen_symbols.pop(sym)
+    await message.answer(f"✅ <b>{sym}</b> is now <b>ACTIVE</b> again.")
+
+
+@router.message(Command("blocked"))
+async def cmd_blocked(message: Message) -> None:
+    if not is_admin(message):
+        await deny(message)
+        return
+    now = time.time()
+    expired = [s for s, t in frozen_symbols.items() if t <= now]
+    for s in expired:
+        frozen_symbols.pop(s)
+
+    banned_text = "".join(f"  🔴 <b>{s}</b>\n" for s in sorted(banned_symbols))
+    frozen_text = "".join(
+        f"  🟡 <b>{s}</b> — {int((t-now)//60)}m {int((t-now)%60)}s\n"
+        for s, t in sorted(frozen_symbols.items())
+    )
+
+    if not banned_text and not frozen_text:
+        await message.answer("✅ No symbols are currently banned or frozen.")
+        return
+
+    parts = ["🚫 <b>Blocked Symbols</b>\n"]
+    if banned_text:
+        parts.append(f"<b>Banned ({len(banned_symbols)}):</b>\n{banned_text}")
+    if frozen_text:
+        parts.append(f"<b>Frozen ({len(frozen_symbols)}):</b>\n{frozen_text}")
+    await message.answer("\n".join(parts))
 
 
 # ---------------------------------------------------------------------------
@@ -490,7 +668,6 @@ async def cmd_symbols(message: Message) -> None:
     if not symbols_discovered:
         await message.answer("⏳ Still discovering, try again in a few seconds.")
         return
-
     now = time.time()
     lines = []
     for sym in sorted(MONITORED_SYMBOLS):
@@ -502,7 +679,6 @@ async def cmd_symbols(message: Message) -> None:
         else:
             tag = "🟢"
         lines.append(f"  {tag} <code>{sym}</code>")
-
     await message.answer(
         f"📋 <b>Monitored symbols ({len(MONITORED_SYMBOLS)}):</b>\n"
         + "\n".join(lines)
@@ -516,59 +692,45 @@ async def cmd_symbols(message: Message) -> None:
 
 @router.message(Command("debug"))
 async def cmd_debug(message: Message) -> None:
-    await message.answer(
-        f"🔍 Hitting <code>{MEXC_TICKER_URL}</code>\nPlease wait..."
-    )
-
+    if not is_admin(message):
+        await deny(message)
+        return
+    await message.answer(f"🔍 Hitting API, please wait...")
     connector = aiohttp.TCPConnector()
     async with aiohttp.ClientSession(connector=connector) as session:
         try:
             async with session.get(
-                MEXC_TICKER_URL,
-                headers=HEADERS,
-                timeout=aiohttp.ClientTimeout(total=30),
-                ssl=True,
+                MEXC_TICKER_URL, headers=HEADERS,
+                timeout=aiohttp.ClientTimeout(total=30), ssl=True,
             ) as response:
                 if response.status != 200:
                     await message.answer(f"❌ HTTP {response.status}")
                     return
-
                 payload = await response.json(content_type=None)
                 data: list[dict] = payload.get("data", [])
-
                 if not data:
-                    await message.answer(
-                        f"⚠️ Connected but data empty!\nKeys: {list(payload.keys())}"
-                    )
+                    await message.answer("⚠️ Connected but data empty!")
                     return
-
                 await message.answer(
-                    f"✅ <b>API reachable</b>\n"
-                    f"Total tickers: <b>{len(data)}</b>\n\n"
-                    f"📄 Sample ticker:\n<code>{data[0]}</code>"
+                    f"✅ <b>API OK</b> — {len(data)} tickers\n\n"
+                    f"Sample: <code>{data[0]}</code>"
                 )
-
                 found, not_found = discover_symbols(data)
                 matched_text = "\n".join(
                     f"  ✅ {base} → <code>{sym}</code>"
                     for sym, base in sorted(found.items(), key=lambda x: x[1])
-                ) or "  none"
-
-                await message.answer(
-                    f"🔎 <b>Matched: {len(found)}/{len(TARGET_BASE_NAMES)}</b>\n\n"
-                    f"{matched_text}"
                 )
-
+                await message.answer(
+                    f"🔎 Matched <b>{len(found)}/{len(TARGET_BASE_NAMES)}</b>\n\n{matched_text}"
+                )
                 if not_found:
                     await message.answer(
-                        f"❌ <b>Not on MEXC ({len(not_found)}):</b>\n"
-                        f"<code>{', '.join(sorted(not_found))}</code>"
+                        f"❌ Not on MEXC: <code>{', '.join(sorted(not_found))}</code>"
                     )
-
         except asyncio.TimeoutError:
             await message.answer("⏱ Timed out. MEXC may be geo-blocking your IP.")
         except Exception as exc:
-            await message.answer(f"💥 Error: <code>{exc}</code>")
+            await message.answer(f"💥 <code>{exc}</code>")
 
 
 # ---------------------------------------------------------------------------
@@ -578,23 +740,18 @@ async def cmd_debug(message: Message) -> None:
 @router.message(Command("test"))
 async def cmd_test(message: Message, bot: Bot) -> None:
     global test_mode, test_chat_id
-
     if not symbols_discovered:
         await message.answer("⏳ Still discovering symbols, try again shortly.")
         return
-
     await message.answer(
-        "🧪 <b>Test mode activated!</b>\n\n"
-        "Scanning for first symbol ≥ <b>0.1%</b> move in 60s.\n"
-        f"One alert fires, then returns to <b>{SURGE_THRESHOLD}% threshold</b>.\n\n"
-        "⚠️ Banned/frozen symbols are <b>skipped</b> even in test mode."
+        "🧪 <b>Test mode activated!</b>\n"
+        "Scanning for first symbol ≥ <b>0.1%</b> move.\n"
+        f"One alert fires then returns to <b>{SURGE_THRESHOLD}%</b>."
     )
-
     best_symbol = None
     best_pct = 0.0
     best_price = 0.0
     now = time.time()
-
     for symbol, window in price_windows.items():
         if symbol in banned_symbols:
             continue
@@ -611,16 +768,15 @@ async def cmd_test(message: Message, bot: Bot) -> None:
             best_pct = pct
             best_symbol = symbol
             best_price = latest_price
-
     if best_symbol:
         await bot.send_message(
             chat_id=message.chat.id,
             text=(
-                f"🧪 <b>[TEST ALERT — 0.1% threshold]</b>\n\n"
+                f"🧪 <b>[TEST — 0.1% threshold]</b>\n\n"
                 f"🚨 <b>FUTURES SURGE: #{best_symbol.replace('_', '')}</b>\n"
                 f"📈 Change: <b>+{best_pct:.2f}%</b> in 60s\n"
                 f"💵 Current Price: <b>${best_price:.4f}</b>\n\n"
-                f"✅ Bot is working! Back to <b>{SURGE_THRESHOLD}%</b>."
+                f"✅ Bot working! Back to <b>{SURGE_THRESHOLD}%</b>."
             ),
             reply_markup=build_trade_keyboard(best_symbol),
         )
@@ -628,10 +784,8 @@ async def cmd_test(message: Message, bot: Bot) -> None:
         test_mode = True
         test_chat_id = message.chat.id
         await message.answer(
-            "⏳ No symbol at 0.1%+ yet.\n"
-            "Watching in background — alert fires the moment any "
-            "active symbol crosses 0.1%.\n\n"
-            "Send /status to see current movers."
+            "⏳ No symbol at 0.1%+ yet — watching in background.\n"
+            "You'll get an alert the moment any symbol crosses 0.1%."
         )
 
 
@@ -641,10 +795,7 @@ async def cmd_test(message: Message, bot: Bot) -> None:
 
 
 def build_alert_message(
-    symbol: str,
-    pct_change: float,
-    current_price: float,
-    is_test: bool = False,
+    symbol: str, pct_change: float, current_price: float, is_test: bool = False
 ) -> str:
     display = symbol.replace("_", "")
     header = "🧪 <b>[TEST ALERT]</b>\n\n" if is_test else ""
@@ -671,29 +822,22 @@ def build_trade_keyboard(symbol: str) -> InlineKeyboardMarkup:
     ])
 
 
-async def send_alert(
-    bot: Bot,
-    symbol: str,
-    pct_change: float,
-    current_price: float,
-    chat_id: Optional[str | int] = None,
-    is_test: bool = False,
+async def send_surge_alert(
+    bot: Bot, symbol: str, pct_change: float, current_price: float,
+    chat_id: Optional[int] = None, is_test: bool = False,
 ) -> None:
-    target = chat_id or CHAT_ID
-    try:
-        await bot.send_message(
-            chat_id=target,
-            text=build_alert_message(symbol, pct_change, current_price, is_test),
-            reply_markup=build_trade_keyboard(symbol),
-        )
-        logger.info(
-            "%s alert: %s +%.2f%%",
-            "TEST" if is_test else "SURGE",
-            symbol,
-            pct_change,
-        )
-    except Exception as exc:
-        logger.error("Failed to send alert for %s: %s", symbol, exc)
+    text = build_alert_message(symbol, pct_change, current_price, is_test)
+    keyboard = build_trade_keyboard(symbol)
+
+    if chat_id:
+        # Single target (test mode)
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+        except Exception as exc:
+            logger.error("Failed to send test alert: %s", exc)
+    else:
+        # Broadcast to all subscribers
+        await broadcast(bot, text, keyboard)
 
 
 # ---------------------------------------------------------------------------
@@ -704,43 +848,30 @@ async def send_alert(
 async def fetch_raw_tickers(session: aiohttp.ClientSession) -> Optional[list[dict]]:
     try:
         async with session.get(
-            MEXC_TICKER_URL,
-            headers=HEADERS,
-            timeout=aiohttp.ClientTimeout(total=30),
-            ssl=True,
+            MEXC_TICKER_URL, headers=HEADERS,
+            timeout=aiohttp.ClientTimeout(total=30), ssl=True,
         ) as response:
             if response.status != 200:
                 logger.warning("HTTP %d from API", response.status)
                 return None
-
             payload: dict = await response.json(content_type=None)
-
             if not payload.get("success"):
                 logger.warning("API returned success=false")
                 return None
-
-            data: list[dict] = payload.get("data", [])
-            return data or None
-
+            return payload.get("data") or None
     except asyncio.TimeoutError:
         logger.warning("Ticker request timed out")
     except aiohttp.ClientConnectionError as exc:
         logger.warning("Connection error: %s", exc)
-    except aiohttp.ClientError as exc:
-        logger.warning("Client error: %s", exc)
     except Exception as exc:
         logger.error("Unexpected error: %s", exc, exc_info=True)
-
     return None
 
 
 def parse_price(ticker: dict) -> Optional[float]:
     raw = (
-        ticker.get("lastPrice")
-        or ticker.get("last_price")
-        or ticker.get("last")
-        or ticker.get("price")
-        or ticker.get("close")
+        ticker.get("lastPrice") or ticker.get("last_price")
+        or ticker.get("last") or ticker.get("price") or ticker.get("close")
     )
     try:
         return float(raw) if raw is not None else None
@@ -769,8 +900,7 @@ def get_pct_change(symbol: str) -> Optional[tuple[float, float]]:
     _, latest_price = window[-1]
     if oldest_price <= 0:
         return None
-    pct = (latest_price / oldest_price - 1) * 100.0
-    return pct, latest_price
+    return (latest_price / oldest_price - 1) * 100.0, latest_price
 
 
 # ---------------------------------------------------------------------------
@@ -796,40 +926,31 @@ async def monitoring_loop(bot: Bot) -> None:
                 now = time.time()
 
                 if not symbols_discovered:
-                    found, not_found = discover_symbols(raw_data)
+                    found, _ = discover_symbols(raw_data)
                     MONITORED_SYMBOLS = set(found.keys())
                     for sym in MONITORED_SYMBOLS:
                         price_windows[sym] = deque()
                     symbols_discovered = True
                     logger.info(
-                        "Discovery complete: %d/%d matched: %s",
-                        len(MONITORED_SYMBOLS),
-                        len(TARGET_BASE_NAMES),
-                        sorted(MONITORED_SYMBOLS),
+                        "Discovery complete: %d/%d matched",
+                        len(MONITORED_SYMBOLS), len(TARGET_BASE_NAMES),
                     )
 
                 # Clean expired freezes
-                expired = [s for s, t in frozen_symbols.items() if t <= now]
-                for s in expired:
+                for s in [s for s, t in frozen_symbols.items() if t <= now]:
                     frozen_symbols.pop(s)
-                    logger.info("Freeze expired for %s — alerts resumed", s)
+                    logger.info("Freeze expired: %s", s)
 
-                ticker_map: dict[str, dict] = {
-                    t.get("symbol", ""): t for t in raw_data
-                }
+                ticker_map = {t.get("symbol", ""): t for t in raw_data}
 
                 for sym in MONITORED_SYMBOLS:
-
-                    # Skip banned symbols entirely
                     if sym in banned_symbols:
                         continue
-
-                    # Skip frozen symbols
                     if sym in frozen_symbols:
                         continue
 
                     ticker = ticker_map.get(sym)
-                    if ticker is None:
+                    if not ticker:
                         continue
 
                     price = parse_price(ticker)
@@ -847,22 +968,20 @@ async def monitoring_loop(bot: Bot) -> None:
                     if test_mode and pct_change >= 0.1:
                         test_mode = False
                         asyncio.create_task(
-                            send_alert(
+                            send_surge_alert(
                                 bot, sym, pct_change, current_price,
-                                chat_id=test_chat_id,
-                                is_test=True,
+                                chat_id=test_chat_id, is_test=True,
                             )
                         )
-                        logger.info("Test satisfied by %s (+%.3f%%), reverting", sym, pct_change)
                         continue
 
-                    # Normal surge alert
+                    # Normal surge alert — broadcast to ALL subscribers
                     if pct_change >= SURGE_THRESHOLD:
                         last_sent = last_alert_time.get(sym, 0.0)
                         if now - last_sent >= COOLDOWN_SECONDS:
                             last_alert_time[sym] = now
                             asyncio.create_task(
-                                send_alert(bot, sym, pct_change, current_price)
+                                send_surge_alert(bot, sym, pct_change, current_price)
                             )
 
             elapsed = time.monotonic() - cycle_start
@@ -883,7 +1002,10 @@ async def main() -> None:
     dp.include_router(router)
 
     me = await bot.get_me()
-    logger.info("Bot authenticated as @%s (id=%d)", me.username, me.id)
+    logger.info(
+        "Bot @%s started — %d subscribers loaded",
+        me.username, len(subscribers),
+    )
 
     monitor_task = asyncio.create_task(monitoring_loop(bot))
 
@@ -894,7 +1016,7 @@ async def main() -> None:
         try:
             await monitor_task
         except asyncio.CancelledError:
-            logger.info("Monitoring loop cancelled cleanly")
+            pass
         await bot.session.close()
         logger.info("Bot shut down")
 
