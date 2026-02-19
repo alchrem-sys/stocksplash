@@ -44,6 +44,7 @@ WINDOW_SECONDS: int = int(os.getenv("WINDOW_SECONDS", "60"))
 COOLDOWN_SECONDS: int = int(os.getenv("COOLDOWN_SECONDS", "60"))
 
 ADMIN_ID = 868931721
+CHANNEL_ID: str = os.getenv("CHANNEL_ID", "")
 
 MEXC_TICKER_URL = "https://futures.mexc.com/api/v1/contract/ticker"
 
@@ -220,23 +221,18 @@ def discover_symbols(all_tickers: list[dict]) -> tuple[dict[str, str], list[str]
 
 
 async def broadcast(bot: Bot, text: str, keyboard: InlineKeyboardMarkup) -> None:
-    dead: list[int] = []
-    for chat_id in list(subscribers.keys()):
-        try:
-            await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
-            await asyncio.sleep(0.05)
-        except Exception as exc:
-            err = str(exc).lower()
-            if "blocked" in err or "not found" in err or "deactivated" in err:
-                dead.append(chat_id)
-            else:
-                logger.error("Failed to send to %d: %s", chat_id, exc)
-    if dead:
-        for cid in dead:
-            subscribers.pop(cid, None)
-        save_subscribers()
-        logger.info("Removed %d dead subscribers", len(dead))
-
+    if not CHANNEL_ID:
+        logger.warning("CHANNEL_ID not set — alert not sent")
+        return
+    try:
+        await bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=text,
+            reply_markup=keyboard,
+        )
+        logger.info("Alert posted to channel %s", CHANNEL_ID)
+    except Exception as exc:
+        logger.error("Failed to post to channel: %s", exc)
 
 # ---------------------------------------------------------------------------
 # Router
