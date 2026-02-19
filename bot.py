@@ -1,6 +1,6 @@
 """
 MEXC Futures Price Surge Monitor Bot
-Version: 7.1.0 — Hardcoded overrides + auto-discovery for the rest
+Version: 7.2.0 — Fully hardcoded symbol map
 """
 
 import asyncio
@@ -60,36 +60,71 @@ HEADERS = {
 }
 
 # ---------------------------------------------------------------------------
-# Symbol definitions
+# Fully hardcoded symbol map — verified from API logs
+# Format: "EXACT_MEXC_SYMBOL": "DISPLAY_NAME"
 # ---------------------------------------------------------------------------
 
-# Manually confirmed exact MEXC symbols for tickers with non-standard naming
 HARDCODED_SYMBOLS: dict[str, str] = {
-    "COINBASE_USDT":  "COIN",
-    "FIGSTOCK_USDT":  "FIG",
-    "GSSTOCK_USDT":   "GS",
-    "MASTOCK_USDT":   "MA",
-    "KOSTOCK_USDT":   "KO",
-    "WMTSTOCK_USDT":  "WMT",
-    "GESTOCK_USDT":   "GE",
-    "ROBINHOOD_USDT": "HOOD",
-    "MUSTOCK_USDT":   "MU",
-    "VSTOCK_USDT":    "V",
-    "NKESTOCK_USDT":  "NKE",
-    "PEPSTOCK_USDT":  "PEP",
-    "BASTOCK_USDT":   "BA",
-}
+    # Indices — standard format
+    "NAS100_USDT":      "NAS100",
+    "HK50_USDT":        "HK50",
+    "US30_USDT":        "US30",
 
-# These use standard BASE_USDT format — discovered automatically
-AUTO_DISCOVER_BASES = [
-    "TSLA", "CVNA", "NVDA", "NAS100", "AMAT", "SP500",
-    "GOOGL", "QCOM", "HK50", "CRM", "AMZN", "FUTU",
-    "AAPL", "SHOP", "MSFT", "US30", "QQQ", "CSCO",
-    "VZ", "INTC", "JNJ", "AMD", "META", "RDDT",
-    "SPOT", "NFLX", "ORCL", "ASML", "ACN", "XOM",
-    "SMCI", "UNH", "NOW", "LLY", "LRCX", "IBM",
-    "COST", "JD", "JPM",
-]
+    # Non-standard names — manually confirmed
+    "COINBASE_USDT":    "COIN",
+    "FIGSTOCK_USDT":    "FIG",
+    "ROBINHOOD_USDT":   "HOOD",
+
+    # STOCK suffix — confirmed from logs
+    "CVNASTOCK_USDT":   "CVNA",
+    "AMATSTOCK_USDT":   "AMAT",
+    "GOOGLSTOCK_USDT":  "GOOGL",
+    "QCOMSTOCK_USDT":   "QCOM",
+    "CRMSTOCK_USDT":    "CRM",
+    "SHOPSTOCK_USDT":   "SHOP",
+    "MSFTSTOCK_USDT":   "MSFT",
+    "VZSTOCK_USDT":     "VZ",
+    "INTCSTOCK_USDT":   "INTC",
+    "QQQSTOCK_USDT":    "QQQ",
+    "CSCOSTOCK_USDT":   "CSCO",
+    "JNJSTOCK_USDT":    "JNJ",
+    "AMZNSTOCK_USDT":   "AMZN",
+    "FUTUSTOCK_USDT":   "FUTU",
+    "AAPLSTOCK_USDT":   "AAPL",
+    "AMDSTOCK_USDT":    "AMD",
+    "XOMSTOCK_USDT":    "XOM",
+    "METASTOCK_USDT":   "META",
+    "RDDTSTOCK_USDT":   "RDDT",
+    "SPOTSTOCK_USDT":   "SPOT",
+    "NFLXSTOCK_USDT":   "NFLX",
+    "SMCISTOCK_USDT":   "SMCI",
+    "ORCLSTOCK_USDT":   "ORCL",
+    "ASMLSTOCK_USDT":   "ASML",
+    "ACNSTOCK_USDT":    "ACN",
+    "UNHSTOCK_USDT":    "UNH",
+    "NOWSTOCK_USDT":    "NOW",
+    "LLYSTOCK_USDT":    "LLY",
+    "LRCXSTOCK_USDT":   "LRCX",
+    "IBMSTOCK_USDT":    "IBM",
+    "COSTSTOCK_USDT":   "COST",
+    "JDSTOCK_USDT":     "JD",
+    "JPMSTOCK_USDT":    "JPM",
+    "GSSTOCK_USDT":     "GS",
+    "MASTOCK_USDT":     "MA",
+    "KOSTOCK_USDT":     "KO",
+    "WMTSTOCK_USDT":    "WMT",
+    "GESTOCK_USDT":     "GE",
+    "MUSTOCK_USDT":     "MU",
+    "VSTOCK_USDT":      "V",
+    "NKESTOCK_USDT":    "NKE",
+    "PEPSTOCK_USDT":    "PEP",
+    "BASTOCK_USDT":     "BA",
+
+    # Unconfirmed — will show warning if wrong, just won't monitor
+    "TSLASTOCK_USDT":   "TSLA",
+    "NVDASTOCK_USDT":   "NVDA",
+    "SP500_USDT":       "SP500",
+}
 
 # ---------------------------------------------------------------------------
 # Persistent subscriber storage
@@ -144,19 +179,14 @@ async def deny(message: Message) -> None:
 
 
 def find_symbol(user_input: str) -> Optional[str]:
-    """Find a monitored symbol from user input like 'TSLA' or 'TSLA_USDT'."""
     s = user_input.upper().strip()
-    # Direct match
     if s in MONITORED_SYMBOLS:
         return s
-    # Try with _USDT suffix
     if s + "_USDT" in MONITORED_SYMBOLS:
         return s + "_USDT"
-    # Match by base name from HARDCODED_SYMBOLS
     for sym, base in HARDCODED_SYMBOLS.items():
         if base.upper() == s and sym in MONITORED_SYMBOLS:
             return sym
-    # Match by base part of any monitored symbol
     for sym in MONITORED_SYMBOLS:
         if sym.split("_")[0].upper() == s:
             return sym
@@ -164,42 +194,22 @@ def find_symbol(user_input: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Symbol discovery
+# Symbol discovery — verify hardcoded symbols exist in API
 # ---------------------------------------------------------------------------
 
 
 def discover_symbols(all_tickers: list[dict]) -> tuple[dict[str, str], list[str]]:
-    """
-    Build the final symbol map by:
-    1. Confirming all HARDCODED_SYMBOLS exist in the API
-    2. Auto-discovering AUTO_DISCOVER_BASES as BASE_USDT
-    """
     api_symbol_set = {t.get("symbol", "") for t in all_tickers}
     found: dict[str, str] = {}
     not_found: list[str] = []
 
-    # Step 1 — hardcoded overrides (exact match required)
     for mexc_sym, base in HARDCODED_SYMBOLS.items():
         if mexc_sym in api_symbol_set:
             found[mexc_sym] = base
-            logger.info("Hardcoded confirmed: %-10s -> %s", base, mexc_sym)
+            logger.info("Confirmed: %-10s -> %s", base, mexc_sym)
         else:
             not_found.append(base)
-            logger.warning("Hardcoded NOT FOUND in API: %s (%s)", base, mexc_sym)
-
-    # Step 2 — auto-discover standard BASE_USDT symbols
-    for base in AUTO_DISCOVER_BASES:
-        match = None
-        for suffix in ("_USDT", "_USDC"):
-            if f"{base}{suffix}" in api_symbol_set:
-                match = f"{base}{suffix}"
-                break
-        if match:
-            found[match] = base
-            logger.info("Auto-discovered: %-10s -> %s", base, match)
-        else:
-            not_found.append(base)
-            logger.warning("Auto NOT FOUND: %s", base)
+            logger.warning("NOT IN API:  %-10s (%s)", base, mexc_sym)
 
     return found, not_found
 
@@ -218,7 +228,6 @@ async def broadcast(bot: Bot, text: str, keyboard: InlineKeyboardMarkup) -> None
         except Exception as exc:
             err = str(exc).lower()
             if "blocked" in err or "not found" in err or "deactivated" in err:
-                logger.warning("Removing dead subscriber %d: %s", chat_id, exc)
                 dead.append(chat_id)
             else:
                 logger.error("Failed to send to %d: %s", chat_id, exc)
@@ -226,6 +235,7 @@ async def broadcast(bot: Bot, text: str, keyboard: InlineKeyboardMarkup) -> None
         for cid in dead:
             subscribers.pop(cid, None)
         save_subscribers()
+        logger.info("Removed %d dead subscribers", len(dead))
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +463,7 @@ async def cmd_symbols(message: Message) -> None:
     now = time.time()
     lines = []
     for sym in sorted(MONITORED_SYMBOLS):
+        display = HARDCODED_SYMBOLS.get(sym, sym)
         if sym in banned_symbols:
             tag = "🔴"
         elif sym in frozen_symbols and frozen_symbols[sym] > now:
@@ -460,7 +471,7 @@ async def cmd_symbols(message: Message) -> None:
             tag = f"🟡{remaining}m"
         else:
             tag = "🟢"
-        lines.append(f"  {tag} <code>{sym}</code>")
+        lines.append(f"  {tag} <b>{display}</b> — <code>{sym}</code>")
     await message.answer(
         f"📋 <b>Monitored symbols ({len(MONITORED_SYMBOLS)}):</b>\n"
         + "\n".join(lines)
@@ -591,7 +602,7 @@ async def cmd_debug(message: Message) -> None:
     if not is_admin(message):
         await deny(message)
         return
-    await message.answer(f"🔍 Hitting API, please wait...")
+    await message.answer("🔍 Hitting API, please wait...")
     connector = aiohttp.TCPConnector()
     async with aiohttp.ClientSession(connector=connector) as session:
         try:
@@ -609,17 +620,19 @@ async def cmd_debug(message: Message) -> None:
                     return
                 found, not_found = discover_symbols(data)
                 matched_text = "\n".join(
-                    f"  ✅ {base} → <code>{sym}</code>"
+                    f"  ✅ <b>{base}</b> → <code>{sym}</code>"
                     for sym, base in sorted(found.items(), key=lambda x: x[1])
                 )
                 await message.answer(
                     f"✅ <b>API OK</b> — {len(data)} tickers\n"
-                    f"Matched <b>{len(found)}/{len(HARDCODED_SYMBOLS) + len(AUTO_DISCOVER_BASES)}</b>\n\n"
+                    f"Matched: <b>{len(found)}/{len(HARDCODED_SYMBOLS)}</b>\n\n"
                     f"{matched_text}"
                 )
                 if not_found:
                     await message.answer(
-                        f"❌ Not found: <code>{', '.join(sorted(not_found))}</code>"
+                        f"❌ <b>Not in API ({len(not_found)}):</b>\n"
+                        f"<code>{', '.join(sorted(not_found))}</code>\n\n"
+                        f"These symbols don't exist on MEXC futures."
                     )
         except asyncio.TimeoutError:
             await message.answer("⏱ Timed out. MEXC may be geo-blocking your IP.")
@@ -687,7 +700,7 @@ async def cmd_test(message: Message, bot: Bot) -> None:
 def build_alert_message(
     symbol: str, pct_change: float, current_price: float, is_test: bool = False
 ) -> str:
-    display = symbol.replace("_", "")
+    display = HARDCODED_SYMBOLS.get(symbol, symbol.replace("_", ""))
     header = "🧪 <b>[TEST ALERT]</b>\n\n" if is_test else ""
     footer = f"\n\n<i>Test — real threshold is {SURGE_THRESHOLD}%</i>" if is_test else ""
     return (
@@ -813,17 +826,16 @@ async def monitoring_loop(bot: Bot) -> None:
                 now = time.time()
 
                 if not symbols_discovered:
-                    found, _ = discover_symbols(raw_data)
+                    found, not_found = discover_symbols(raw_data)
                     MONITORED_SYMBOLS = set(found.keys())
                     for sym in MONITORED_SYMBOLS:
                         price_windows[sym] = deque()
                     symbols_discovered = True
                     logger.info(
-                        "Discovery complete: %d symbols active",
-                        len(MONITORED_SYMBOLS),
+                        "Ready: monitoring %d symbols (%d not on MEXC)",
+                        len(MONITORED_SYMBOLS), len(not_found),
                     )
 
-                # Clean expired freezes
                 for s in [s for s, t in frozen_symbols.items() if t <= now]:
                     frozen_symbols.pop(s)
                     logger.info("Freeze expired: %s", s)
@@ -885,10 +897,7 @@ async def main() -> None:
     dp.include_router(router)
 
     me = await bot.get_me()
-    logger.info(
-        "Bot @%s started — %d subscribers loaded",
-        me.username, len(subscribers),
-    )
+    logger.info("Bot @%s started — %d subscribers loaded", me.username, len(subscribers))
 
     monitor_task = asyncio.create_task(monitoring_loop(bot))
 
