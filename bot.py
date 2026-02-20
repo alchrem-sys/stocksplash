@@ -288,10 +288,6 @@ def build_trade_keyboard(symbol: str) -> InlineKeyboardMarkup:
             text="🔗 Open Chart on MEXC",
             url=f"https://futures.mexc.com/exchange/{symbol}"
         )],
-        [InlineKeyboardButton(
-            text="⚡ Trade Now",
-            url=f"https://futures.mexc.com/exchange/{symbol}?type=futures"
-        )],
     ])
 
 
