@@ -42,7 +42,8 @@ if not BOT_TOKEN:
 FETCH_INTERVAL: float = float(os.getenv("FETCH_INTERVAL", "2"))
 WINDOW_SECONDS: int = int(os.getenv("WINDOW_SECONDS", "60"))
 COOLDOWN_SECONDS: int = int(os.getenv("COOLDOWN_SECONDS", "60"))
-CHANNEL_ID: str = os.getenv("CHANNEL_ID", "")
+CHANNEL_ID: str = os.getenv("CHANNEL_ID", "") or os.getenv("CHAT_ID", "")
+THREAD_ID: Optional[int] = int(os.getenv("THREAD_ID", "0")) or None
 
 # Runtime-adjustable threshold (changed via /threshold command)
 surge_threshold: float = float(os.getenv("SURGE_THRESHOLD", "1.0"))
@@ -250,8 +251,13 @@ async def broadcast(bot: Bot, text: str, keyboard: InlineKeyboardMarkup) -> None
         logger.warning("CHANNEL_ID not set — alert not sent")
         return
     try:
-        await bot.send_message(chat_id=CHANNEL_ID, text=text, reply_markup=keyboard)
-        logger.info("Alert posted to channel %s", CHANNEL_ID)
+        await bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=text,
+            reply_markup=keyboard,
+            message_thread_id=THREAD_ID,
+        )
+        logger.info("Alert posted to %s thread=%s", CHANNEL_ID, THREAD_ID)
     except Exception as exc:
         logger.error("Failed to post to channel: %s", exc)
 
