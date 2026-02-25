@@ -714,6 +714,21 @@ async def cmd_broadcast(message: Message) -> None:
     await reply(message, f"✅ Sent: <b>{sent}</b>, Removed dead: <b>{len(dead)}</b>")
 
 
+@router.message(Command("debugconfig"))
+async def cmd_debugconfig(message: Message) -> None:
+    if not is_admin(message):
+        await deny(message)
+        return
+    await reply(message,
+        f"⚙️ <b>Current Config</b>\n\n"
+        f"CHANNEL_ID: <code>{CHANNEL_ID or 'NOT SET'}</code>\n"
+        f"THREAD_ID:  <code>{THREAD_ID or 'NOT SET'}</code>\n"
+        f"THRESHOLD:  <code>±{surge_threshold}%</code>\n"
+        f"WINDOW:     <code>{WINDOW_SECONDS}s</code>\n"
+        f"COOLDOWN:   <code>{COOLDOWN_SECONDS}s</code>"
+    )
+
+
 @router.message(Command("debug"))
 async def cmd_debug(message: Message) -> None:
     if not is_admin(message):
@@ -999,9 +1014,24 @@ async def main() -> None:
 
     me = await bot.get_me()
     logger.info(
-        "Bot @%s started — threshold=±%.1f%% channel=%s subscribers=%d",
-        me.username, surge_threshold, CHANNEL_ID or "NOT SET", len(subscribers),
+        "Bot @%s started — threshold=±%.1f%% channel=%s thread=%s subscribers=%d",
+        me.username, surge_threshold,
+        CHANNEL_ID or "NOT SET",
+        THREAD_ID or "NOT SET",
+        len(subscribers),
     )
+
+    # Verify we can actually reach the thread at startup
+    if CHANNEL_ID:
+        try:
+            await bot.send_message(
+                chat_id=CHANNEL_ID,
+                text="🟢 <b>Splash bot started</b> — monitoring active.",
+                message_thread_id=THREAD_ID,
+            )
+            logger.info("Startup ping to thread OK")
+        except Exception as exc:
+            logger.error("STARTUP PING FAILED — check CHAT_ID/THREAD_ID: %s", exc)
 
     monitor_task = asyncio.create_task(monitoring_loop(bot))
 
