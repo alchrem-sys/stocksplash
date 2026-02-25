@@ -18,6 +18,7 @@ from aiogram import Bot, Dispatcher, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
+from aiogram import F
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
@@ -185,8 +186,23 @@ def is_admin(message: Message) -> bool:
     return message.from_user is not None and message.from_user.id == ADMIN_ID
 
 
+async def reply(message: Message, text: str, **kwargs) -> None:
+    """
+    Smart reply — always responds in the same thread the command came from.
+    Works for DMs, groups, and forum topic threads alike.
+    """
+    thread_id = message.message_thread_id if message.is_topic_message else None
+    await message.bot.send_message(
+        chat_id=message.chat.id,
+        text=text,
+        message_thread_id=thread_id,
+        parse_mode="HTML",
+        **kwargs,
+    )
+
+
 async def deny(message: Message) -> None:
-    await message.answer("⛔ You are not authorized to use this command.")
+    await reply(message, "⛔ You are not authorized to use this command.")
 
 
 def find_symbol(user_input: str) -> Optional[str]:
@@ -349,7 +365,7 @@ async def cmd_help(message: Message) -> None:
             "/test — test alert at 0.1% threshold\n"
         )
 
-    await message.answer(
+    await reply(message, 
         "<b>📖 MEXC Surge Monitor — Help</b>\n\n"
         "<b>📊 Info commands:</b>\n"
         "/status — live stats + top 5 movers\n"
@@ -373,7 +389,7 @@ async def cmd_threshold(message: Message) -> None:
         return
     args = (message.text or "").split()[1:]
     if not args:
-        await message.answer(
+        await reply(message, 
             f"Current threshold: <b>±{surge_threshold}%</b>\n\n"
             "Usage: <code>/threshold 2.0</code>"
         )
@@ -383,11 +399,11 @@ async def cmd_threshold(message: Message) -> None:
         if new_val <= 0 or new_val > 100:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Must be a number between 0.1 and 100.")
+        await reply(message, "❌ Must be a number between 0.1 and 100.")
         return
     old = surge_threshold
     surge_threshold = new_val
-    await message.answer(f"✅ Threshold: <b>±{old}%</b> → <b>±{new_val}%</b>")
+    await reply(message, f"✅ Threshold: <b>±{old}%</b> → <b>±{new_val}%</b>")
 
 
 @router.message(Command("mute"))
@@ -399,21 +415,21 @@ async def cmd_mute(message: Message) -> None:
     args = (message.text or "").split()[1:]
     if not args:
         if is_muted():
-            await message.answer(f"🔇 Muted — <b>{mute_remaining()}</b> remaining.\nUse /unmute to restore.")
+            await reply(message, f"🔇 Muted — <b>{mute_remaining()}</b> remaining.\nUse /unmute to restore.")
         else:
-            await message.answer("Usage: <code>/mute MINUTES</code>")
+            await reply(message, "Usage: <code>/mute MINUTES</code>")
         return
     try:
         minutes = float(args[0])
         if minutes <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Minutes must be a positive number.")
+        await reply(message, "❌ Minutes must be a positive number.")
         return
     muted_until = time.time() + minutes * 60
     h = int(minutes // 60)
     m = int(minutes % 60)
-    await message.answer(f"🔇 <b>Muted for {'{}h {}m'.format(h,m) if h else '{}m'.format(m)}</b>\nUse /unmute to restore.")
+    await reply(message, f"🔇 <b>Muted for {'{}h {}m'.format(h,m) if h else '{}m'.format(m)}</b>\nUse /unmute to restore.")
 
 
 @router.message(Command("unmute"))
@@ -423,16 +439,16 @@ async def cmd_unmute(message: Message) -> None:
         await deny(message)
         return
     if not is_muted():
-        await message.answer("ℹ️ Bot is not muted.")
+        await reply(message, "ℹ️ Bot is not muted.")
         return
     muted_until = 0.0
-    await message.answer("🔊 <b>Alerts restored!</b>")
+    await reply(message, "🔊 <b>Alerts restored!</b>")
 
 
 @router.message(Command("status"))
 async def cmd_status(message: Message) -> None:
     if not symbols_discovered:
-        await message.answer("⏳ Still discovering symbols, try again shortly.")
+        await reply(message, "⏳ Still discovering symbols, try again shortly.")
         return
 
     now = time.time()
@@ -483,7 +499,7 @@ async def cmd_status(message: Message) -> None:
         if is_admin(message) else ""
     )
 
-    await message.answer(
+    await reply(message, 
         f"📊 <b>Monitor Status</b>\n\n"
         f"🔍 Symbols watched: <b>{len(MONITORED_SYMBOLS)}</b>\n"
         f"📈 Windows with data: <b>{windows_with_data}/{len(MONITORED_SYMBOLS)}</b>\n"
@@ -502,7 +518,7 @@ async def cmd_symbols(message: Message) -> None:
         await deny(message)
         return
     if not symbols_discovered:
-        await message.answer("⏳ Still discovering, try again shortly.")
+        await reply(message, "⏳ Still discovering, try again shortly.")
         return
     now = time.time()
     lines = []
@@ -516,7 +532,7 @@ async def cmd_symbols(message: Message) -> None:
         else:
             tag = "🟢"
         lines.append(f"  {tag} <b>{display}</b> — <code>{sym}</code>")
-    await message.answer(
+    await reply(message, 
         f"📋 <b>Monitored symbols ({len(MONITORED_SYMBOLS)}):</b>\n"
         + "\n".join(lines)
         + "\n\n🟢 Active  🟡 Frozen  🔴 Banned"
@@ -530,15 +546,15 @@ async def cmd_ban(message: Message) -> None:
         return
     args = (message.text or "").split()[1:]
     if not args:
-        await message.answer("Usage: <code>/ban SYMBOL</code>")
+        await reply(message, "Usage: <code>/ban SYMBOL</code>")
         return
     sym = find_symbol(args[0])
     if not sym:
-        await message.answer(f"❌ <code>{args[0].upper()}</code> not found.")
+        await reply(message, f"❌ <code>{args[0].upper()}</code> not found.")
         return
     banned_symbols.add(sym)
     frozen_symbols.pop(sym, None)
-    await message.answer(f"🔴 <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b> BANNED.")
+    await reply(message, f"🔴 <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b> BANNED.")
 
 
 @router.message(Command("unban"))
@@ -548,14 +564,14 @@ async def cmd_unban(message: Message) -> None:
         return
     args = (message.text or "").split()[1:]
     if not args:
-        await message.answer("Usage: <code>/unban SYMBOL</code>")
+        await reply(message, "Usage: <code>/unban SYMBOL</code>")
         return
     sym = find_symbol(args[0])
     if not sym or sym not in banned_symbols:
-        await message.answer(f"❌ Not found or not banned.")
+        await reply(message, f"❌ Not found or not banned.")
         return
     banned_symbols.discard(sym)
-    await message.answer(f"✅ <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b> is ACTIVE again.")
+    await reply(message, f"✅ <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b> is ACTIVE again.")
 
 
 @router.message(Command("freeze"))
@@ -565,22 +581,22 @@ async def cmd_freeze(message: Message) -> None:
         return
     args = (message.text or "").split()[1:]
     if len(args) < 2:
-        await message.answer("Usage: <code>/freeze SYMBOL MINUTES</code>")
+        await reply(message, "Usage: <code>/freeze SYMBOL MINUTES</code>")
         return
     sym = find_symbol(args[0])
     if not sym:
-        await message.answer(f"❌ <code>{args[0].upper()}</code> not found.")
+        await reply(message, f"❌ <code>{args[0].upper()}</code> not found.")
         return
     try:
         minutes = float(args[1])
         if minutes <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Minutes must be a positive number.")
+        await reply(message, "❌ Minutes must be a positive number.")
         return
     frozen_symbols[sym] = time.time() + minutes * 60
     h, m = int(minutes // 60), int(minutes % 60)
-    await message.answer(f"🟡 <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b> frozen for <b>{'{}h {}m'.format(h,m) if h else '{}m'.format(m)}</b>.")
+    await reply(message, f"🟡 <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b> frozen for <b>{'{}h {}m'.format(h,m) if h else '{}m'.format(m)}</b>.")
 
 
 @router.message(Command("unfreeze"))
@@ -590,14 +606,14 @@ async def cmd_unfreeze(message: Message) -> None:
         return
     args = (message.text or "").split()[1:]
     if not args:
-        await message.answer("Usage: <code>/unfreeze SYMBOL</code>")
+        await reply(message, "Usage: <code>/unfreeze SYMBOL</code>")
         return
     sym = find_symbol(args[0])
     if not sym or sym not in frozen_symbols:
-        await message.answer("❌ Not found or not frozen.")
+        await reply(message, "❌ Not found or not frozen.")
         return
     frozen_symbols.pop(sym)
-    await message.answer(f"✅ <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b> is ACTIVE again.")
+    await reply(message, f"✅ <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b> is ACTIVE again.")
 
 
 @router.message(Command("blocked"))
@@ -615,7 +631,7 @@ async def cmd_blocked(message: Message) -> None:
     )
     mute_text = f"\n🔇 <b>Muted</b> — {mute_remaining()} remaining\n" if is_muted() else ""
     if not banned_text and not frozen_text and not mute_text:
-        await message.answer("✅ Nothing blocked, bot not muted.")
+        await reply(message, "✅ Nothing blocked, bot not muted.")
         return
     parts = ["🚫 <b>Blocked Status</b>\n"]
     if mute_text:
@@ -624,7 +640,7 @@ async def cmd_blocked(message: Message) -> None:
         parts.append(f"<b>Banned ({len(banned_symbols)}):</b>\n{banned_text}")
     if frozen_text:
         parts.append(f"<b>Frozen ({len(frozen_symbols)}):</b>\n{frozen_text}")
-    await message.answer("\n".join(parts))
+    await reply(message, "\n".join(parts))
 
 
 @router.message(Command("subscribers"))
@@ -633,7 +649,7 @@ async def cmd_subscribers(message: Message) -> None:
         await deny(message)
         return
     if not subscribers:
-        await message.answer("📭 No subscribers yet.")
+        await reply(message, "📭 No subscribers yet.")
         return
     lines = []
     for i, (cid, info) in enumerate(subscribers.items(), 1):
@@ -641,7 +657,7 @@ async def cmd_subscribers(message: Message) -> None:
         lines.append(f"{i}. <b>{info['name']}</b> {info['username']}\n   <code>{cid}</code> | {joined}")
     chunks = [lines[i:i+30] for i in range(0, len(lines), 30)]
     for chunk in chunks:
-        await message.answer(f"👥 <b>Subscribers ({len(subscribers)}):</b>\n\n" + "\n\n".join(chunk))
+        await reply(message, f"👥 <b>Subscribers ({len(subscribers)}):</b>\n\n" + "\n\n".join(chunk))
 
 
 @router.message(Command("kick"))
@@ -651,20 +667,20 @@ async def cmd_kick(message: Message) -> None:
         return
     args = (message.text or "").split()[1:]
     if not args:
-        await message.answer("Usage: <code>/kick CHAT_ID</code>")
+        await reply(message, "Usage: <code>/kick CHAT_ID</code>")
         return
     try:
         target_id = int(args[0])
     except ValueError:
-        await message.answer("❌ Invalid ID.")
+        await reply(message, "❌ Invalid ID.")
         return
     if target_id not in subscribers:
-        await message.answer(f"ℹ️ Not subscribed.")
+        await reply(message, f"ℹ️ Not subscribed.")
         return
     name = subscribers[target_id]["name"]
     subscribers.pop(target_id)
     save_subscribers()
-    await message.answer(f"✅ Removed <b>{name}</b>.")
+    await reply(message, f"✅ Removed <b>{name}</b>.")
     try:
         await message.bot.send_message(chat_id=target_id, text="ℹ️ You have been removed by the admin.")
     except Exception:
@@ -678,10 +694,10 @@ async def cmd_broadcast(message: Message) -> None:
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer("Usage: <code>/broadcast Your message here</code>")
+        await reply(message, "Usage: <code>/broadcast Your message here</code>")
         return
     msg = parts[1]
-    await message.answer(f"📣 Sending to <b>{len(subscribers)}</b> subscribers...")
+    await reply(message, f"📣 Sending to <b>{len(subscribers)}</b> subscribers...")
     sent, dead = 0, []
     for chat_id in list(subscribers.keys()):
         try:
@@ -695,7 +711,7 @@ async def cmd_broadcast(message: Message) -> None:
         subscribers.pop(cid, None)
     if dead:
         save_subscribers()
-    await message.answer(f"✅ Sent: <b>{sent}</b>, Removed dead: <b>{len(dead)}</b>")
+    await reply(message, f"✅ Sent: <b>{sent}</b>, Removed dead: <b>{len(dead)}</b>")
 
 
 @router.message(Command("debug"))
@@ -703,7 +719,7 @@ async def cmd_debug(message: Message) -> None:
     if not is_admin(message):
         await deny(message)
         return
-    await message.answer("🔍 Hitting API, please wait...")
+    await reply(message, "🔍 Hitting API, please wait...")
     connector = aiohttp.TCPConnector()
     async with aiohttp.ClientSession(connector=connector) as session:
         try:
@@ -712,12 +728,12 @@ async def cmd_debug(message: Message) -> None:
                 timeout=aiohttp.ClientTimeout(total=30), ssl=True,
             ) as response:
                 if response.status != 200:
-                    await message.answer(f"❌ HTTP {response.status}")
+                    await reply(message, f"❌ HTTP {response.status}")
                     return
                 payload = await response.json(content_type=None)
                 data: list[dict] = payload.get("data", [])
                 if not data:
-                    await message.answer("⚠️ Connected but data empty!")
+                    await reply(message, "⚠️ Connected but data empty!")
                     return
                 found, not_found = discover_symbols(data)
                 # Also check bid1/ask1 availability on a sample ticker
@@ -731,17 +747,17 @@ async def cmd_debug(message: Message) -> None:
                     f"  ✅ <b>{base}</b> → <code>{sym}</code>"
                     for sym, base in sorted(found.items(), key=lambda x: x[1])
                 )
-                await message.answer(
+                await reply(message, 
                     f"✅ <b>API OK</b> — {len(data)} tickers\n"
                     f"Matched: <b>{len(found)}/{len(HARDCODED_SYMBOLS)}</b>{book_info}\n\n"
                     f"{matched_text}"
                 )
                 if not_found:
-                    await message.answer(f"❌ Not in API: <code>{', '.join(sorted(not_found))}</code>")
+                    await reply(message, f"❌ Not in API: <code>{', '.join(sorted(not_found))}</code>")
         except asyncio.TimeoutError:
-            await message.answer("⏱ Timed out.")
+            await reply(message, "⏱ Timed out.")
         except Exception as exc:
-            await message.answer(f"💥 <code>{exc}</code>")
+            await reply(message, f"💥 <code>{exc}</code>")
 
 
 @router.message(Command("test"))
@@ -751,9 +767,9 @@ async def cmd_test(message: Message, bot: Bot) -> None:
         await deny(message)
         return
     if not symbols_discovered:
-        await message.answer("⏳ Still discovering symbols, try again shortly.")
+        await reply(message, "⏳ Still discovering symbols, try again shortly.")
         return
-    await message.answer(
+    await reply(message, 
         "🧪 <b>Test mode activated!</b>\n"
         "Scanning for first symbol with ≥ <b>0.1%</b> move via bid1/ask1.\n"
         f"One alert fires then returns to <b>±{surge_threshold}%</b>."
@@ -784,12 +800,15 @@ async def cmd_test(message: Message, bot: Bot) -> None:
                 best_pct, best_symbol, best_price, best_ptype = -down_pct, symbol, latest.ask1, "ask1"
 
     if best_symbol:
+        # Always send to group thread if configured, regardless of where /test was called from
         await send_surge_alert(bot, best_symbol, best_pct, best_price, best_ptype,
-                               chat_id=message.chat.id, is_test=True)
+                               chat_id=None if CHANNEL_ID else message.chat.id, is_test=True)
+        if CHANNEL_ID:
+            await reply(message, "🧪 Test alert sent to the group thread!")
     else:
         test_mode    = True
         test_chat_id = message.chat.id
-        await message.answer("⏳ No symbol at 0.1%+ yet — watching in background.")
+        await reply(message, "⏳ No symbol at 0.1%+ yet — watching in background.")
 
 
 # ---------------------------------------------------------------------------
@@ -930,9 +949,11 @@ async def monitoring_loop(bot: Bot) -> None:
                         if result:
                             pct, price, ptype = result
                             test_mode = False
+                            # Send to group thread if configured, else back to DM
+                            target = None if CHANNEL_ID else test_chat_id
                             asyncio.create_task(
                                 send_surge_alert(bot, sym, pct, price, ptype,
-                                                 chat_id=test_chat_id, is_test=True)
+                                                 chat_id=target, is_test=True)
                             )
                             continue
 
@@ -985,7 +1006,10 @@ async def main() -> None:
     monitor_task = asyncio.create_task(monitoring_loop(bot))
 
     try:
-        await dp.start_polling(bot, allowed_updates=["message"])
+        await dp.start_polling(
+            bot,
+            allowed_updates=["message", "channel_post"],
+        )
     finally:
         monitor_task.cancel()
         try:
