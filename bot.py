@@ -912,6 +912,64 @@ def check_movement(symbol: str, threshold: float) -> Optional[tuple[float, float
 # ---------------------------------------------------------------------------
 
 
+async def auto_mute_scheduler(bot: Bot) -> None:
+    """
+    Auto-mutes during market open volatility every weekday:
+      14:29 UTC → mute (1 min before NYSE open at 14:30 UTC / 9:30 AM EST)
+      15:30 UTC → unmute (1 hour after open)
+    """
+    global muted_until
+    last_mute_date   = None
+    last_unmute_date = None
+
+    logger.info("Auto-mute scheduler started — will mute 14:29–15:30 UTC on weekdays")
+
+    while True:
+        await asyncio.sleep(20)
+        try:
+            import datetime
+            now_utc  = datetime.datetime.utcnow()
+            weekday  = now_utc.weekday()  # 0=Mon, 4=Fri
+            today    = now_utc.date()
+            h, m     = now_utc.hour, now_utc.minute
+
+            if weekday >= 5:  # Saturday / Sunday — skip
+                continue
+
+            # Mute window: 14:29 → 15:30 UTC
+            in_mute_window = (h == 14 and m >= 29) or (h == 15 and m < 30)
+
+            if in_mute_window and last_mute_date != today:
+                muted_until    = time.time() + 61 * 60  # 61 min covers full window
+                last_mute_date = today
+                logger.info("Auto-mute engaged for market open (14:29–15:30 UTC)")
+                try:
+                    await bot.send_message(
+                        chat_id=CHANNEL_ID,
+                        text="🔇 <b>Auto-muted</b> — market open volatility window (14:29–15:30 UTC)\nAlerts resume at 15:30 UTC.",
+                        message_thread_id=THREAD_ID,
+                    )
+                except Exception:
+                    pass
+
+            elif not in_mute_window and last_mute_date == today and last_unmute_date != today:
+                if h == 15 and m >= 30:
+                    muted_until      = 0.0
+                    last_unmute_date = today
+                    logger.info("Auto-unmute — market open window passed")
+                    try:
+                        await bot.send_message(
+                            chat_id=CHANNEL_ID,
+                            text="🔊 <b>Auto-unmuted</b> — market open window passed, alerts active.",
+                            message_thread_id=THREAD_ID,
+                        )
+                    except Exception:
+                        pass
+
+        except Exception as exc:
+            logger.error("Auto-mute scheduler error: %s", exc)
+
+
 async def monitoring_loop(bot: Bot) -> None:
     global test_mode, test_chat_id, MONITORED_SYMBOLS, symbols_discovered
 
@@ -1033,7 +1091,8 @@ async def main() -> None:
         except Exception as exc:
             logger.error("STARTUP PING FAILED — check CHAT_ID/THREAD_ID: %s", exc)
 
-    monitor_task = asyncio.create_task(monitoring_loop(bot))
+    monitor_task   = asyncio.create_task(monitoring_loop(bot))
+    automute_task  = asyncio.create_task(auto_mute_scheduler(bot))
 
     try:
         await dp.start_polling(
@@ -1042,10 +1101,12 @@ async def main() -> None:
         )
     finally:
         monitor_task.cancel()
-        try:
-            await monitor_task
-        except asyncio.CancelledError:
-            pass
+        automute_task.cancel()
+        for task in (monitor_task, automute_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         await bot.session.close()
         logger.info("Bot shut down")
 
