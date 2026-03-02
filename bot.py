@@ -414,14 +414,42 @@ async def cmd_mute(message: Message) -> None:
         if is_muted():
             await reply(message, f"🔇 Muted — <b>{mute_remaining()}</b> remaining.\nUse /unmute to restore.")
         else:
-            await reply(message, "Usage: <code>/mute MINUTES</code>")
+            await reply(message,
+                "Usage:\n"
+                "<code>/mute 30</code> — mute all alerts for 30 minutes\n"
+                "<code>/mute TSLA 30</code> — mute TSLA specifically for 30 minutes")
         return
+
+    # Check if first arg is a ticker or a number
+    ticker = find_symbol(args[0])
+    if ticker:
+        # /mute TICKER MINUTES
+        if len(args) < 2:
+            await reply(message, f"Usage: <code>/mute {args[0].upper()} 30</code>")
+            return
+        try:
+            minutes = float(args[1])
+            if minutes <= 0:
+                raise ValueError
+        except ValueError:
+            await reply(message, "❌ Minutes must be a positive number.")
+            return
+        frozen_symbols[ticker] = time.time() + minutes * 60
+        display = HARDCODED_SYMBOLS.get(ticker, ticker)
+        h = int(minutes // 60)
+        m = int(minutes % 60)
+        await reply(message,
+            f"🔇 <b>{display}</b> muted for <b>{'{}h {}m'.format(h,m) if h else '{}m'.format(m)}</b>\n"
+            f"Use <code>/unfreeze {display}</code> to restore early.")
+        return
+
+    # /mute MINUTES
     try:
         minutes = float(args[0])
         if minutes <= 0:
             raise ValueError
     except ValueError:
-        await reply(message, "❌ Minutes must be a positive number.")
+        await reply(message, "❌ Unknown symbol or invalid number.")
         return
     muted_until = time.time() + minutes * 60
     h = int(minutes // 60)
