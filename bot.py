@@ -409,9 +409,6 @@ async def cmd_threshold(message: Message) -> None:
 @router.message(Command("mute"))
 async def cmd_mute(message: Message) -> None:
     global muted_until
-    if not is_admin(message):
-        await deny(message)
-        return
     args = (message.text or "").split()[1:]
     if not args:
         if is_muted():
@@ -435,9 +432,6 @@ async def cmd_mute(message: Message) -> None:
 @router.message(Command("unmute"))
 async def cmd_unmute(message: Message) -> None:
     global muted_until
-    if not is_admin(message):
-        await deny(message)
-        return
     if not is_muted():
         await reply(message, "ℹ️ Bot is not muted.")
         return
