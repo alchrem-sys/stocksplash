@@ -958,8 +958,11 @@ async def auto_mute_scheduler(bot: Bot) -> None:
             if weekday >= 5:  # Saturday / Sunday — skip
                 continue
 
-            # Mute window: 14:29 → 15:30 UTC
-            in_mute_window = (h == 14 and m >= 29) or (h == 15 and m < 30)
+            # Mute window 1: 01:00–01:05 UTC (brief overnight pause)
+            in_mute_window_1 = h == 1 and m < 5
+            # Mute window 2: 14:29–15:30 UTC (market open)
+            in_mute_window_2 = (h == 14 and m >= 29) or (h == 15 and m < 30)
+            in_mute_window   = in_mute_window_1 or in_mute_window_2
 
             if in_mute_window and last_mute_date != today:
                 muted_until    = time.time() + 61 * 60  # 61 min covers full window
