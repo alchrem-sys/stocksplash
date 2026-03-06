@@ -935,59 +935,63 @@ def check_movement(symbol: str, threshold: float) -> Optional[tuple[float, float
 
 
 async def auto_mute_scheduler(bot: Bot) -> None:
-    """
-    Auto-mutes during market open volatility every weekday:
-      14:29 UTC → mute (1 min before NYSE open at 14:30 UTC / 9:30 AM EST)
-      15:30 UTC → unmute (1 hour after open)
-    """
     global muted_until
-    last_mute_date   = None
-    last_unmute_date = None
+    # Track each window independently so one firing doesn't block another
+    last_muted:   dict[str, object] = {}   # window_key → date
+    last_unmuted: dict[str, object] = {}   # window_key → date
 
-    logger.info("Auto-mute scheduler started — will mute 14:29–15:30 UTC on weekdays")
+    logger.info("Auto-mute scheduler started")
 
     while True:
         await asyncio.sleep(20)
         try:
             import datetime
-            now_utc  = datetime.datetime.utcnow()
-            weekday  = now_utc.weekday()  # 0=Mon, 4=Fri
-            today    = now_utc.date()
-            h, m     = now_utc.hour, now_utc.minute
+            now_utc = datetime.datetime.utcnow()
+            weekday = now_utc.weekday()
+            today   = now_utc.date()
+            h, m    = now_utc.hour, now_utc.minute
 
-            if weekday >= 5:  # Saturday / Sunday — skip
+            if weekday >= 5:
                 continue
 
-            # Mute window 1: 01:00–01:05 UTC (brief overnight pause)
-            in_mute_window_1 = h == 1 and m < 5
-            # Mute window 2: 14:29–15:30 UTC (market open)
-            in_mute_window_2 = (h == 14 and m >= 29) or (h == 15 and m < 30)
-            in_mute_window   = in_mute_window_1 or in_mute_window_2
+            windows = {
+                "01:00": {
+                    "active":    h == 1 and m < 5,
+                    "duration":  5 * 60,
+                    "mute_msg":  "🔇 <b>Auto-muted</b> — 01:00 UTC pause (5 min).",
+                    "unmute_h":  1, "unmute_m": 5,
+                    "unmute_msg": "🔊 <b>Auto-unmuted</b> — 01:05 UTC.",
+                },
+                "14:29": {
+                    "active":    (h == 14 and m >= 29) or (h == 15 and m < 30),
+                    "duration":  61 * 60,
+                    "mute_msg":  "🔇 <b>Auto-muted</b> — market open window (14:29–15:30 UTC).",
+                    "unmute_h":  15, "unmute_m": 30,
+                    "unmute_msg": "🔊 <b>Auto-unmuted</b> — market open window passed.",
+                },
+            }
 
-            if in_mute_window and last_mute_date != today:
-                muted_until    = time.time() + 61 * 60  # 61 min covers full window
-                last_mute_date = today
-                logger.info("Auto-mute engaged for market open (14:29–15:30 UTC)")
-                try:
-                    await bot.send_message(
-                        chat_id=CHANNEL_ID,
-                        text="🔇 <b>Auto-muted</b> — market open volatility window (14:29–15:30 UTC)\nAlerts resume at 15:30 UTC.",
-                        message_thread_id=THREAD_ID,
-                    )
-                except Exception:
-                    pass
-
-            elif not in_mute_window and last_mute_date == today and last_unmute_date != today:
-                if h == 15 and m >= 30:
-                    muted_until      = 0.0
-                    last_unmute_date = today
-                    logger.info("Auto-unmute — market open window passed")
+            for key, w in windows.items():
+                if w["active"] and last_muted.get(key) != today:
+                    muted_until         = time.time() + w["duration"]
+                    last_muted[key]     = today
+                    logger.info("Auto-mute: %s window", key)
                     try:
-                        await bot.send_message(
-                            chat_id=CHANNEL_ID,
-                            text="🔊 <b>Auto-unmuted</b> — market open window passed, alerts active.",
-                            message_thread_id=THREAD_ID,
-                        )
+                        await bot.send_message(chat_id=CHANNEL_ID, text=w["mute_msg"],
+                                               message_thread_id=THREAD_ID)
+                    except Exception:
+                        pass
+
+                elif (not w["active"]
+                      and last_muted.get(key) == today
+                      and last_unmuted.get(key) != today
+                      and h >= w["unmute_h"] and m >= w["unmute_m"]):
+                    muted_until          = 0.0
+                    last_unmuted[key]    = today
+                    logger.info("Auto-unmute: %s window passed", key)
+                    try:
+                        await bot.send_message(chat_id=CHANNEL_ID, text=w["unmute_msg"],
+                                               message_thread_id=THREAD_ID)
                     except Exception:
                         pass
 
