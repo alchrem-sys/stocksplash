@@ -488,40 +488,27 @@ async def cmd_status(message: Message) -> None:
         return
 
     now = time.time()
-    windows_with_data = sum(1 for w in price_windows.values() if len(w) >= 2)
+    windows_with_data = sum(1 for tr in trackers.values() if tr.floor_price > 0)
     on_cooldown = sum(
         1 for sym in MONITORED_SYMBOLS
         if now - max(last_surge_alert.get(sym, 0), last_crash_alert.get(sym, 0)) < COOLDOWN_SECONDS
     )
 
-    # ── CHANGED: compute movers from bid1 (up) and ask1 (down) ──
+    # Show top movers based on how far current price is from tracked floor/ceiling
     movers = []
-    for symbol, window in price_windows.items():
-        if len(window) < 2:
-            continue
-        oldest, latest = window[0], window[-1]
-        if oldest.bid1 > 0:
-            up_pct = (latest.bid1 - oldest.bid1) / oldest.bid1 * 100
-            movers.append((symbol, up_pct, latest.bid1))
-        if oldest.ask1 > 0:
-            down_pct = (oldest.ask1 - latest.ask1) / oldest.ask1 * 100
-            movers.append((symbol, -down_pct, latest.ask1))
+    for symbol, tr in trackers.items():
+        if tr.floor_price > 0 and tr.floor_time > 0:
+            elapsed = now - tr.floor_time
+            if elapsed < SPLASH_WINDOW:
+                movers.append((symbol, elapsed, tr.floor_price))
 
-    movers.sort(key=lambda x: x[1], reverse=True)
-
+    movers.sort(key=lambda x: x[1])
     top_text = ""
-    for sym, pct, price in movers[:3]:
+    for sym, elapsed, price in movers[:5]:
         tag = " 🔴" if sym in banned_symbols else (
             " 🟡" if sym in frozen_symbols and frozen_symbols[sym] > now else ""
         )
-        top_text += f"  📈 <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b>{tag}: {pct:+.3f}% @ ${price:.4f}\n"
-    for sym, pct, price in movers[-3:]:
-        if pct >= 0:
-            continue
-        tag = " 🔴" if sym in banned_symbols else (
-            " 🟡" if sym in frozen_symbols and frozen_symbols[sym] > now else ""
-        )
-        top_text += f"  📉 <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b>{tag}: {pct:+.3f}% @ ${price:.4f}\n"
+        top_text += f"  📌 <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b>{tag}: floor ${price:.4f} ({int(elapsed)}s ago)\n"
 
     if not top_text:
         top_text = "  ⏳ Filling window, wait 10s...\n"
@@ -784,46 +771,41 @@ async def cmd_test(message: Message, bot: Bot) -> None:
     if not symbols_discovered:
         await reply(message, "⏳ Still discovering symbols, try again shortly.")
         return
-    await reply(message, 
+    await reply(message,
         "🧪 <b>Test mode activated!</b>\n"
         "Scanning for first symbol with ≥ <b>0.1%</b> move via bid1/ask1.\n"
         f"One alert fires then returns to <b>±{surge_threshold}%</b>."
     )
-    best_symbol   = None
-    best_pct      = 0.0
-    best_price    = 0.0
-    best_ptype    = "bid1"
-    now           = time.time()
+    best_symbol  = None
+    best_pct     = 0.0
+    best_price   = 0.0
+    best_ptype   = "bid1"
+    best_elapsed = 0
+    now          = time.time()
 
-    for symbol, window in price_windows.items():
+    for symbol, tr in trackers.items():
         if symbol in banned_symbols:
             continue
         if symbol in frozen_symbols and frozen_symbols[symbol] > now:
             continue
-        if len(window) < 2:
-            continue
-        oldest, latest = window[0], window[-1]
-        # Check UP via bid1
-        if oldest.bid1 > 0:
-            up_pct = (latest.bid1 - oldest.bid1) / oldest.bid1 * 100
-            if up_pct >= 0.1 and up_pct > abs(best_pct):
-                best_pct, best_symbol, best_price, best_ptype = up_pct, symbol, latest.bid1, "bid1"
-        # Check DOWN via ask1
-        if oldest.ask1 > 0:
-            down_pct = (oldest.ask1 - latest.ask1) / oldest.ask1 * 100
-            if down_pct >= 0.1 and down_pct > abs(best_pct):
-                best_pct, best_symbol, best_price, best_ptype = -down_pct, symbol, latest.ask1, "ask1"
 
-    if best_symbol:
-        # Always send to group thread if configured, regardless of where /test was called from
-        await send_surge_alert(bot, best_symbol, best_pct, best_price, best_ptype,
-                               chat_id=None if CHANNEL_ID else message.chat.id, is_test=True)
-        if CHANNEL_ID:
-            await reply(message, "🧪 Test alert sent to the group thread!")
-    else:
-        test_mode    = True
-        test_chat_id = message.chat.id
-        await reply(message, "⏳ No symbol at 0.1%+ yet — watching in background.")
+        # Check UP: rise from floor
+        if tr.floor_price > 0 and tr.floor_time > 0:
+            # we don't have a current ask1 here — skip; test mode fires in the loop
+            pass
+
+    # No snapshot data available at command time — fall back to background test mode
+    test_mode    = True
+    test_chat_id = message.chat.id
+    await reply(message, "⏳ Watching for next 0.1%+ move — alert will fire to the group thread.")
+
+
+
+
+# Catch-all: silently ignore any non-command messages (prevents "not handled" log spam)
+@router.message()
+async def cmd_catch_all(message: Message) -> None:
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -1158,7 +1140,7 @@ async def main() -> None:
     try:
         await dp.start_polling(
             bot,
-            allowed_updates=["message", "channel_post"],
+            allowed_updates=["message"],
         )
     finally:
         monitor_task.cancel()
