@@ -384,9 +384,6 @@ async def cmd_help(message: Message) -> None:
 @router.message(Command("threshold"))
 async def cmd_threshold(message: Message) -> None:
     global surge_threshold
-    if not is_admin(message):
-        await deny(message)
-        return
     args = (message.text or "").split()[1:]
     if not args:
         await reply(message, 
@@ -536,9 +533,6 @@ async def cmd_status(message: Message) -> None:
 
 @router.message(Command("symbols"))
 async def cmd_symbols(message: Message) -> None:
-    if not is_admin(message):
-        await deny(message)
-        return
     if not symbols_discovered:
         await reply(message, "⏳ Still discovering, try again shortly.")
         return
@@ -563,9 +557,6 @@ async def cmd_symbols(message: Message) -> None:
 
 @router.message(Command("ban"))
 async def cmd_ban(message: Message) -> None:
-    if not is_admin(message):
-        await deny(message)
-        return
     args = (message.text or "").split()[1:]
     if not args:
         await reply(message, "Usage: <code>/ban SYMBOL</code>")
@@ -581,9 +572,6 @@ async def cmd_ban(message: Message) -> None:
 
 @router.message(Command("unban"))
 async def cmd_unban(message: Message) -> None:
-    if not is_admin(message):
-        await deny(message)
-        return
     args = (message.text or "").split()[1:]
     if not args:
         await reply(message, "Usage: <code>/unban SYMBOL</code>")
@@ -598,9 +586,6 @@ async def cmd_unban(message: Message) -> None:
 
 @router.message(Command("freeze"))
 async def cmd_freeze(message: Message) -> None:
-    if not is_admin(message):
-        await deny(message)
-        return
     args = (message.text or "").split()[1:]
     if len(args) < 2:
         await reply(message, "Usage: <code>/freeze SYMBOL MINUTES</code>")
@@ -623,9 +608,6 @@ async def cmd_freeze(message: Message) -> None:
 
 @router.message(Command("unfreeze"))
 async def cmd_unfreeze(message: Message) -> None:
-    if not is_admin(message):
-        await deny(message)
-        return
     args = (message.text or "").split()[1:]
     if not args:
         await reply(message, "Usage: <code>/unfreeze SYMBOL</code>")
@@ -640,9 +622,6 @@ async def cmd_unfreeze(message: Message) -> None:
 
 @router.message(Command("blocked"))
 async def cmd_blocked(message: Message) -> None:
-    if not is_admin(message):
-        await deny(message)
-        return
     now = time.time()
     for s in [s for s, t in list(frozen_symbols.items()) if t <= now]:
         frozen_symbols.pop(s)
@@ -667,9 +646,6 @@ async def cmd_blocked(message: Message) -> None:
 
 @router.message(Command("subscribers"))
 async def cmd_subscribers(message: Message) -> None:
-    if not is_admin(message):
-        await deny(message)
-        return
     if not subscribers:
         await reply(message, "📭 No subscribers yet.")
         return
@@ -684,9 +660,6 @@ async def cmd_subscribers(message: Message) -> None:
 
 @router.message(Command("kick"))
 async def cmd_kick(message: Message) -> None:
-    if not is_admin(message):
-        await deny(message)
-        return
     args = (message.text or "").split()[1:]
     if not args:
         await reply(message, "Usage: <code>/kick CHAT_ID</code>")
@@ -711,9 +684,6 @@ async def cmd_kick(message: Message) -> None:
 
 @router.message(Command("broadcast"))
 async def cmd_broadcast(message: Message) -> None:
-    if not is_admin(message):
-        await deny(message)
-        return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
         await reply(message, "Usage: <code>/broadcast Your message here</code>")
@@ -738,9 +708,6 @@ async def cmd_broadcast(message: Message) -> None:
 
 @router.message(Command("debugconfig"))
 async def cmd_debugconfig(message: Message) -> None:
-    if not is_admin(message):
-        await deny(message)
-        return
     await reply(message,
         f"⚙️ <b>Current Config</b>\n\n"
         f"CHANNEL_ID: <code>{CHANNEL_ID or 'NOT SET'}</code>\n"
@@ -753,9 +720,6 @@ async def cmd_debugconfig(message: Message) -> None:
 
 @router.message(Command("debug"))
 async def cmd_debug(message: Message) -> None:
-    if not is_admin(message):
-        await deny(message)
-        return
     await reply(message, "🔍 Hitting API, please wait...")
     connector = aiohttp.TCPConnector()
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -800,9 +764,6 @@ async def cmd_debug(message: Message) -> None:
 @router.message(Command("test"))
 async def cmd_test(message: Message, bot: Bot) -> None:
     global test_mode, test_chat_id
-    if not is_admin(message):
-        await deny(message)
-        return
     if not symbols_discovered:
         await reply(message, "⏳ Still discovering symbols, try again shortly.")
         return
@@ -955,18 +916,18 @@ async def auto_mute_scheduler(bot: Bot) -> None:
                 continue
 
             windows = {
-                "01:00": {
-                    "active":    h == 1 and m < 5,
+                "00:00": {
+                    "active":    h == 0 and m < 5,
                     "duration":  5 * 60,
-                    "mute_msg":  "🔇 <b>Auto-muted</b> — 01:00 UTC pause (5 min).",
-                    "unmute_h":  1, "unmute_m": 5,
-                    "unmute_msg": "🔊 <b>Auto-unmuted</b> — 01:05 UTC.",
+                    "mute_msg":  "🔇 <b>Auto-muted</b> — 00:00 UTC pause (5 min).",
+                    "unmute_h":  0, "unmute_m": 5,
+                    "unmute_msg": "🔊 <b>Auto-unmuted</b> — 00:05 UTC.",
                 },
-                "14:29": {
-                    "active":    (h == 14 and m >= 29) or (h == 15 and m < 30),
+                "13:29": {
+                    "active":    (h == 13 and m >= 29) or (h == 14 and m < 30),
                     "duration":  61 * 60,
-                    "mute_msg":  "🔇 <b>Auto-muted</b> — market open window (14:29–15:30 UTC).",
-                    "unmute_h":  15, "unmute_m": 30,
+                    "mute_msg":  "🔇 <b>Auto-muted</b> — market open window (13:29–14:30 UTC).",
+                    "unmute_h":  14, "unmute_m": 30,
                     "unmute_msg": "🔊 <b>Auto-unmuted</b> — market open window passed.",
                 },
             }
