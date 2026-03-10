@@ -161,10 +161,25 @@ class BookSnapshot:
     ask1: float
 
 
+@dataclass
+class SplashTracker:
+    """
+    Tracks the lowest ask1 (for UP splash) and highest bid1 (for DOWN crash)
+    within a rolling 60-second window. Resets when the window expires.
+    """
+    # UP: track lowest ask1 → alert when ask1 rises >= threshold from floor
+    floor_price: float = 0.0   # lowest ask1 seen
+    floor_time:  float = 0.0   # when floor was set
+
+    # DOWN: track highest bid1 → alert when bid1 falls >= threshold from ceiling
+    ceil_price:  float = 0.0   # highest bid1 seen
+    ceil_time:   float = 0.0   # when ceiling was set
+
+
 MONITORED_SYMBOLS: set[str] = set()
 
-# ── CHANGED: store bid1+ask1 snapshots instead of single price ──
-price_windows: dict[str, deque[BookSnapshot]] = {}
+# New: one tracker per symbol
+trackers: dict[str, SplashTracker] = {}
 
 last_surge_alert: dict[str, float] = {}
 last_crash_alert: dict[str, float] = {}
@@ -287,21 +302,22 @@ def build_surge_message(
     symbol: str,
     pct_change: float,
     current_price: float,
-    price_type: str,        # "bid1" or "ask1"
+    price_type: str,
+    elapsed_seconds: int = 0,
     is_test: bool = False,
 ) -> str:
-    display = HARDCODED_SYMBOLS.get(symbol, symbol.replace("_", ""))
+    display  = HARDCODED_SYMBOLS.get(symbol, symbol.replace("_", ""))
     is_crash = pct_change < 0
-    emoji = "🔴" if is_crash else "🚨"
+    emoji    = "🔴" if is_crash else "🚨"
     direction = "CRASH" if is_crash else "SURGE"
-    arrow = "📉" if is_crash else "📈"
-    sign = "" if is_crash else "+"
-    header = "🧪 <b>[TEST ALERT]</b>\n\n" if is_test else ""
-    footer = f"\n\n<i>Test — real threshold is ±{surge_threshold}%</i>" if is_test else ""
+    arrow    = "📉" if is_crash else "📈"
+    sign     = "" if is_crash else "+"
+    header   = "🧪 <b>[TEST ALERT]</b>\n\n" if is_test else ""
+    footer   = f"\n\n<i>Test — real threshold is ±{surge_threshold}%</i>" if is_test else ""
     return (
         f"{header}"
         f"{emoji} <b>FUTURES {direction}: #{display}</b>\n"
-        f"{arrow} Change: <b>{sign}{pct_change:.2f}%</b> in {WINDOW_SECONDS}s\n"
+        f"{arrow} Change: <b>{sign}{pct_change:.2f}%</b> in <b>{elapsed_seconds}s</b>\n"
         f"📌 MEXC ({price_type}): <b>${current_price:.4f}</b>"
         f"{footer}"
     )
@@ -322,10 +338,11 @@ async def send_surge_alert(
     pct_change: float,
     current_price: float,
     price_type: str = "bid1",
+    elapsed_seconds: int = 0,
     chat_id: Optional[int] = None,
     is_test: bool = False,
 ) -> None:
-    text = build_surge_message(symbol, pct_change, current_price, price_type, is_test)
+    text = build_surge_message(symbol, pct_change, current_price, price_type, elapsed_seconds, is_test)
     keyboard = build_trade_keyboard(symbol)
     if chat_id:
         try:
@@ -855,39 +872,89 @@ def parse_book(ticker: dict) -> Optional[tuple[float, float]]:
 # ---------------------------------------------------------------------------
 
 
-def update_window(symbol: str, now: float, bid1: float, ask1: float) -> None:
-    window = price_windows[symbol]
-    window.append(BookSnapshot(ts=now, bid1=bid1, ask1=ask1))
-    cutoff = now - WINDOW_SECONDS
-    while window and window[0].ts < cutoff:
-        window.popleft()
+SPLASH_WINDOW: int = 60   # seconds before resetting floor/ceiling
 
 
+def update_and_check(
+    symbol: str,
+    now: float,
+    bid1: float,
+    ask1: float,
+    threshold: float,
+) -> Optional[tuple[float, float, str, int]]:
+    """
+    Core splash detection logic.
+
+    Tracks the LOWEST ask1 (floor) for UP splashes and
+    the HIGHEST bid1 (ceiling) for DOWN crashes.
+
+    Returns (pct_change, price, price_type, elapsed_seconds) or None.
+
+    Rules:
+      - If ask1 sets a new low → update floor + reset timer
+      - If ask1 >= floor * (1 + threshold/100) → UP alert, reset
+      - If 60s pass since floor was set and threshold not reached → reset
+      (same logic mirrored for DOWN via bid1)
+    """
+    tr = trackers[symbol]
+
+    result = None
+
+    # ── UP: track lowest ask1 ─────────────────────────────────────────────
+    if ask1 > 0:
+        if tr.floor_price == 0.0:
+            # First reading — initialise floor
+            tr.floor_price = ask1
+            tr.floor_time  = now
+        elif ask1 < tr.floor_price:
+            # New low → update floor, restart timer
+            tr.floor_price = ask1
+            tr.floor_time  = now
+        else:
+            elapsed = now - tr.floor_time
+            rise_pct = (ask1 - tr.floor_price) / tr.floor_price * 100
+
+            if rise_pct >= threshold:
+                # 🚀 SPLASH triggered
+                result = (rise_pct, ask1, "ask1", int(elapsed))
+                # Reset for next cycle
+                tr.floor_price = ask1
+                tr.floor_time  = now
+            elif elapsed > SPLASH_WINDOW:
+                # Timeout — no splash within 60s, reset
+                tr.floor_price = ask1
+                tr.floor_time  = now
+
+    # ── DOWN: track highest bid1 ──────────────────────────────────────────
+    if bid1 > 0 and result is None:
+        if tr.ceil_price == 0.0:
+            tr.ceil_price = bid1
+            tr.ceil_time  = now
+        elif bid1 > tr.ceil_price:
+            tr.ceil_price = bid1
+            tr.ceil_time  = now
+        else:
+            elapsed  = now - tr.ceil_time
+            fall_pct = (tr.ceil_price - bid1) / tr.ceil_price * 100
+
+            if fall_pct >= threshold:
+                result = (-fall_pct, bid1, "bid1", int(elapsed))
+                tr.ceil_price = bid1
+                tr.ceil_time  = now
+            elif elapsed > SPLASH_WINDOW:
+                tr.ceil_price = bid1
+                tr.ceil_time  = now
+
+    return result
+
+
+# Keep for test mode compatibility
 def check_movement(symbol: str, threshold: float) -> Optional[tuple[float, float, str]]:
-    """
-    Returns (pct_change, actionable_price, price_type) or None.
-
-    UP   move → measured via bid1  → positive pct  → price_type = "bid1"
-    DOWN move → measured via ask1  → negative pct  → price_type = "ask1"
-    """
-    window = price_windows[symbol]
-    if len(window) < 2:
+    tr = trackers.get(symbol)
+    if not tr or tr.floor_price == 0.0:
         return None
-    oldest, latest = window[0], window[-1]
-
-    # UP: bid1 rose
-    if oldest.bid1 > 0:
-        up_pct = (latest.bid1 - oldest.bid1) / oldest.bid1 * 100
-        if up_pct >= threshold:
-            return up_pct, latest.bid1, "bid1"
-
-    # DOWN: ask1 fell
-    if oldest.ask1 > 0:
-        down_pct = (oldest.ask1 - latest.ask1) / oldest.ask1 * 100
-        if down_pct >= threshold:
-            return -down_pct, latest.ask1, "ask1"
-
-    return None
+    ask1 = tr.floor_price  # use last known floor as proxy
+    return None  # test mode will use update_and_check directly
 
 
 # ---------------------------------------------------------------------------
@@ -981,7 +1048,7 @@ async def monitoring_loop(bot: Bot) -> None:
                     found, not_found = discover_symbols(raw_data)
                     MONITORED_SYMBOLS = set(found.keys())
                     for sym in MONITORED_SYMBOLS:
-                        price_windows[sym] = deque()
+                        trackers[sym] = SplashTracker()
                     symbols_discovered = True
                     logger.info("Ready: %d symbols (%d missing)", len(MONITORED_SYMBOLS), len(not_found))
 
@@ -999,48 +1066,52 @@ async def monitoring_loop(bot: Bot) -> None:
                     if not ticker:
                         continue
 
-                    # ── CHANGED: use bid1/ask1 instead of lastPrice ──
                     book = parse_book(ticker)
                     if book is None:
                         continue
                     bid1, ask1 = book
-                    update_window(sym, now, bid1, ask1)
 
-                    # Test mode
+                    # Initialise tracker on first sight
+                    if sym not in trackers:
+                        trackers[sym] = SplashTracker()
+
+                    # Test mode — use low 0.1% threshold
                     if test_mode:
-                        result = check_movement(sym, 0.1)
+                        result = update_and_check(sym, now, bid1, ask1, 0.1)
                         if result:
-                            pct, price, ptype = result
+                            pct, price, ptype, elapsed = result
                             test_mode = False
-                            # Send to group thread if configured, else back to DM
                             target = None if CHANNEL_ID else test_chat_id
                             asyncio.create_task(
                                 send_surge_alert(bot, sym, pct, price, ptype,
+                                                 elapsed_seconds=elapsed,
                                                  chat_id=target, is_test=True)
                             )
-                            continue
-
-                    if is_muted():
                         continue
 
-                    result = check_movement(sym, surge_threshold)
+                    if is_muted():
+                        # Still update tracker so floor/ceiling stay fresh
+                        update_and_check(sym, now, bid1, ask1, 9999)
+                        continue
+
+                    result = update_and_check(sym, now, bid1, ask1, surge_threshold)
                     if result:
-                        pct, price, ptype = result
-                        # Surge (UP via bid1)
+                        pct, price, ptype, elapsed = result
                         if pct > 0:
                             last_sent = last_surge_alert.get(sym, 0.0)
                             if now - last_sent >= COOLDOWN_SECONDS:
                                 last_surge_alert[sym] = now
                                 asyncio.create_task(
-                                    send_surge_alert(bot, sym, pct, price, ptype)
+                                    send_surge_alert(bot, sym, pct, price, ptype,
+                                                     elapsed_seconds=elapsed)
                                 )
-                        # Crash (DOWN via ask1)
                         else:
                             last_sent = last_crash_alert.get(sym, 0.0)
                             if now - last_sent >= COOLDOWN_SECONDS:
                                 last_crash_alert[sym] = now
                                 asyncio.create_task(
-                                    send_surge_alert(bot, sym, pct, price, ptype)
+                                    send_surge_alert(bot, sym, pct, price, ptype,
+                                                     elapsed_seconds=elapsed)
                                 )
 
             elapsed = time.monotonic() - cycle_start
