@@ -965,7 +965,7 @@ async def auto_mute_scheduler(bot: Bot) -> None:
                 continue
 
             windows = {
-                "00:00": {
+                "23:59": {
                     "active":    h == 0 and m < 5,
                     "duration":  5 * 60,
                     "mute_msg":  "🔇 <b>Auto-muted</b> — 00:00 UTC pause (5 min).",
