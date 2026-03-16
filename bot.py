@@ -854,7 +854,19 @@ def parse_book(ticker: dict) -> Optional[tuple[float, float]]:
 # ---------------------------------------------------------------------------
 
 
-SPLASH_WINDOW: int = 60   # seconds before resetting floor/ceiling
+SPLASH_WINDOW_DAY:   int = 15   # seconds — market hours (08:00–21:00 UTC)
+SPLASH_WINDOW_NIGHT: int = 60   # seconds — night hours  (21:00–08:00 UTC)
+
+
+def get_splash_window() -> int:
+    """Returns 15s during market hours, 60s at night (23:00–08:00 UTC)."""
+    import datetime
+    h = datetime.datetime.utcnow().hour
+    return SPLASH_WINDOW_DAY if 8 <= h < 23 else SPLASH_WINDOW_NIGHT
+
+
+# Keep for reference
+SPLASH_WINDOW: int = SPLASH_WINDOW_DAY
 
 
 def update_and_check(
@@ -902,8 +914,8 @@ def update_and_check(
                 # Reset for next cycle
                 tr.floor_price = ask1
                 tr.floor_time  = now
-            elif elapsed > SPLASH_WINDOW:
-                # Timeout — no splash within 60s, reset
+            elif elapsed > get_splash_window():
+                # Timeout — no splash within window, reset
                 tr.floor_price = ask1
                 tr.floor_time  = now
 
@@ -923,9 +935,9 @@ def update_and_check(
                 result = (-fall_pct, bid1, "bid1", int(elapsed))
                 tr.ceil_price = bid1
                 tr.ceil_time  = now
-            elif elapsed > SPLASH_WINDOW:
-                tr.ceil_price = bid1
-                tr.ceil_time  = now
+            elif elapsed > get_splash_window():
+                    tr.ceil_price = bid1
+                    tr.ceil_time  = now
 
     return result
 
@@ -965,7 +977,7 @@ async def auto_mute_scheduler(bot: Bot) -> None:
                 continue
 
             windows = {
-                "23:59": {
+                "00:00": {
                     "active":    h == 0 and m < 5,
                     "duration":  5 * 60,
                     "mute_msg":  "🔇 <b>Auto-muted</b> — 00:00 UTC pause (5 min).",
