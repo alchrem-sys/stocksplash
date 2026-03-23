@@ -324,12 +324,38 @@ def build_surge_message(
 
 
 def build_trade_keyboard(symbol: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="🔗 Open Chart on MEXC",
+    # Map MEXC symbol → Yahoo ticker (for stocks only; indices/others get no Yahoo button)
+    YAHOO_MAP: dict[str, str] = {
+        "TSLASTOCK_USDT": "TSLA", "NVDASTOCK_USDT": "NVDA", "AAPLSTOCK_USDT": "AAPL",
+        "MSFTSTOCK_USDT": "MSFT", "AMZNSTOCK_USDT": "AMZN", "METASTOCK_USDT": "META",
+        "AMDSTOCK_USDT":  "AMD",  "GOOGLSTOCK_USDT": "GOOGL", "COINBASE_USDT": "COIN",
+        "CVNASTOCK_USDT": "CVNA", "AMATSTOCK_USDT": "AMAT",  "QCOMSTOCK_USDT": "QCOM",
+        "CRMSTOCK_USDT":  "CRM",  "SHOPSTOCK_USDT": "SHOP",  "VZSTOCK_USDT":   "VZ",
+        "INTCSTOCK_USDT": "INTC", "QQQSTOCK_USDT":  "QQQ",   "CSCOSTOCK_USDT": "CSCO",
+        "JNJSTOCK_USDT":  "JNJ",  "FUTUSTOCK_USDT": "FUTU",  "XOMSTOCK_USDT":  "XOM",
+        "RDDTSTOCK_USDT": "RDDT", "SPOTSTOCK_USDT": "SPOT",  "NFLXSTOCK_USDT": "NFLX",
+        "SMCISTOCK_USDT": "SMCI", "ORCLSTOCK_USDT": "ORCL",  "ASMLSTOCK_USDT": "ASML",
+        "ACNSTOCK_USDT":  "ACN",  "UNHSTOCK_USDT":  "UNH",   "NOWSTOCK_USDT":  "NOW",
+        "LLYSTOCK_USDT":  "LLY",  "LRCXSTOCK_USDT": "LRCX",  "IBMSTOCK_USDT":  "IBM",
+        "COSTSTOCK_USDT": "COST", "JDSTOCK_USDT":   "JD",    "JPMSTOCK_USDT":  "JPM",
+        "GSSTOCK_USDT":   "GS",   "MASTOCK_USDT":   "MA",    "KOSTOCK_USDT":   "KO",
+        "WMTSTOCK_USDT":  "WMT",  "GESTOCK_USDT":   "GE",    "MUSTOCK_USDT":   "MU",
+        "VSTOCK_USDT":    "V",    "NKESTOCK_USDT":  "NKE",   "PEPSTOCK_USDT":  "PEP",
+        "BASTOCK_USDT":   "BA",   "ROBINHOOD_USDT": "HOOD",  "FIGSTOCK_USDT":  "FIG",
+    }
+    yahoo_ticker = YAHOO_MAP.get(symbol)
+    buttons = [
+        InlineKeyboardButton(
+            text="📊 MEXC Futures",
             url=f"https://futures.mexc.com/exchange/{symbol}"
-        )],
-    ])
+        )
+    ]
+    if yahoo_ticker:
+        buttons.append(InlineKeyboardButton(
+            text="📈 Yahoo Finance",
+            url=f"https://finance.yahoo.com/quote/{yahoo_ticker}"
+        ))
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
 async def send_surge_alert(
