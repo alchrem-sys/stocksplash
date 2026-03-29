@@ -8,6 +8,8 @@ import json
 import logging
 import os
 import time
+import threading
+import requests as _requests
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,8 +68,108 @@ HEADERS = {
 }
 
 # ---------------------------------------------------------------------------
-# Hardcoded symbol map
+# Yahoo Finance — cookie/crumb fetch (same as spread bot)
 # ---------------------------------------------------------------------------
+
+_yahoo_session = _requests.Session()
+_yahoo_crumb:  Optional[str] = None
+_yahoo_cookie: Optional[str] = None
+_crumb_lock    = threading.Lock()
+
+_YAHOO_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection":      "keep-alive",
+}
+
+# MEXC symbol → Yahoo ticker (stocks only)
+YAHOO_MAP: dict[str, str] = {
+    "TSLASTOCK_USDT": "TSLA", "NVDASTOCK_USDT": "NVDA", "AAPLSTOCK_USDT": "AAPL",
+    "MSFTSTOCK_USDT": "MSFT", "AMZNSTOCK_USDT": "AMZN", "METASTOCK_USDT": "META",
+    "AMDSTOCK_USDT":  "AMD",  "GOOGLSTOCK_USDT": "GOOGL", "COINBASE_USDT": "COIN",
+    "CVNASTOCK_USDT": "CVNA", "AMATSTOCK_USDT": "AMAT",  "QCOMSTOCK_USDT": "QCOM",
+    "CRMSTOCK_USDT":  "CRM",  "SHOPSTOCK_USDT": "SHOP",  "VZSTOCK_USDT":   "VZ",
+    "INTCSTOCK_USDT": "INTC", "QQQSTOCK_USDT":  "QQQ",   "CSCOSTOCK_USDT": "CSCO",
+    "JNJSTOCK_USDT":  "JNJ",  "FUTUSTOCK_USDT": "FUTU",  "XOMSTOCK_USDT":  "XOM",
+    "RDDTSTOCK_USDT": "RDDT", "SPOTSTOCK_USDT": "SPOT",  "NFLXSTOCK_USDT": "NFLX",
+    "SMCISTOCK_USDT": "SMCI", "ORCLSTOCK_USDT": "ORCL",  "ASMLSTOCK_USDT": "ASML",
+    "ACNSTOCK_USDT":  "ACN",  "UNHSTOCK_USDT":  "UNH",   "NOWSTOCK_USDT":  "NOW",
+    "LLYSTOCK_USDT":  "LLY",  "LRCXSTOCK_USDT": "LRCX",  "IBMSTOCK_USDT":  "IBM",
+    "COSTSTOCK_USDT": "COST", "JDSTOCK_USDT":   "JD",    "JPMSTOCK_USDT":  "JPM",
+    "GSSTOCK_USDT":   "GS",   "MASTOCK_USDT":   "MA",    "KOSTOCK_USDT":   "KO",
+    "WMTSTOCK_USDT":  "WMT",  "GESTOCK_USDT":   "GE",    "MUSTOCK_USDT":   "MU",
+    "VSTOCK_USDT":    "V",    "NKESTOCK_USDT":  "NKE",   "PEPSTOCK_USDT":  "PEP",
+    "BASTOCK_USDT":   "BA",   "ROBINHOOD_USDT": "HOOD",  "FIGSTOCK_USDT":  "FIG",
+}
+
+
+def _refresh_yahoo_crumb() -> bool:
+    global _yahoo_crumb, _yahoo_cookie
+    try:
+        r = _yahoo_session.get("https://finance.yahoo.com", headers=_YAHOO_HEADERS, timeout=10)
+        if "consent" in r.url:
+            _yahoo_session.post(
+                "https://consent.yahoo.com/v2/collectConsent",
+                data={"agree": ["agree"], "consentUUID": "default", "sessionId": "default"},
+                headers=_YAHOO_HEADERS, timeout=10,
+            )
+        r2 = _yahoo_session.get(
+            "https://query1.finance.yahoo.com/v1/test/getcrumb",
+            headers={**_YAHOO_HEADERS, "Accept": "text/plain"}, timeout=10,
+        )
+        if r2.status_code == 200 and r2.text and len(r2.text) < 50:
+            _yahoo_crumb  = r2.text.strip()
+            _yahoo_cookie = "; ".join(f"{k}={v}" for k, v in _yahoo_session.cookies.items())
+            logger.info("Yahoo crumb OK")
+            return True
+        return False
+    except Exception as exc:
+        logger.error("Yahoo crumb error: %s", exc)
+        return False
+
+
+def _fetch_yahoo_price(ticker: str) -> Optional[float]:
+    """Fetch current price for a single ticker. Returns None on failure."""
+    global _yahoo_crumb
+    with _crumb_lock:
+        if not _yahoo_crumb:
+            _refresh_yahoo_crumb()
+    try:
+        resp = _yahoo_session.get(
+            "https://query1.finance.yahoo.com/v7/finance/quote",
+            params={
+                "symbols": ticker,
+                "fields":  "regularMarketPrice,preMarketPrice,postMarketPrice,marketState,regularMarketTime,postMarketTime,preMarketTime",
+                "crumb":   _yahoo_crumb or "",
+            },
+            headers={**_YAHOO_HEADERS, "Cookie": _yahoo_cookie or ""},
+            timeout=8,
+        )
+        if resp.status_code in (401, 403):
+            with _crumb_lock:
+                _refresh_yahoo_crumb()
+            return None
+        results = resp.json().get("quoteResponse", {}).get("result", [])
+        if not results:
+            return None
+        q = results[0]
+        # Use same timestamp logic as spread bot
+        reg_price  = float(q.get("regularMarketPrice") or 0) or None
+        pre_price  = float(q.get("preMarketPrice")     or 0) or None
+        post_price = float(q.get("postMarketPrice")    or 0) or None
+        reg_time   = int(q.get("regularMarketTime")    or 0)
+        pre_time   = int(q.get("preMarketTime")        or 0)
+        post_time  = int(q.get("postMarketTime")       or 0)
+        if post_price and post_time > reg_time:
+            return post_price
+        if pre_price and pre_time > reg_time:
+            return pre_price
+        return reg_price
+    except Exception as exc:
+        logger.warning("Yahoo price fetch error for %s: %s", ticker, exc)
+        return None
 
 HARDCODED_SYMBOLS: dict[str, str] = {
     "NAS100_USDT":     "NAS100",
@@ -304,45 +406,21 @@ def build_surge_message(
     current_price: float,
     price_type: str,
     elapsed_seconds: int = 0,
+    yahoo_price: Optional[float] = None,
     is_test: bool = False,
 ) -> str:
     display  = HARDCODED_SYMBOLS.get(symbol, symbol.replace("_", ""))
-    is_crash = pct_change < 0
-    emoji    = "🔴" if is_crash else "🚨"
-    direction = "CRASH" if is_crash else "SURGE"
-    arrow    = "📉" if is_crash else "📈"
-    sign     = "" if is_crash else "+"
-    header   = "🧪 <b>[TEST ALERT]</b>\n\n" if is_test else ""
-    footer   = f"\n\n<i>Test — real threshold is ±{surge_threshold}%</i>" if is_test else ""
+    sign     = "" if pct_change < 0 else "+"
+    header   = "🧪 <b>[TEST]</b> " if is_test else ""
+    yahoo_line = f"\nYahoo:  <b>${yahoo_price:.4f}</b>" if yahoo_price else ""
     return (
-        f"{header}"
-        f"{emoji} <b>FUTURES {direction}: #{display}</b>\n"
-        f"{arrow} Change: <b>{sign}{pct_change:.2f}%</b> in <b>{elapsed_seconds}s</b>\n"
-        f"📌 MEXC ({price_type}): <b>${current_price:.4f}</b>"
-        f"{footer}"
+        f"{header}<b>${display}</b>  {sign}{pct_change:.2f}%  +{elapsed_seconds}s\n"
+        f"MEXC:   <b>${current_price:.4f}</b>"
+        f"{yahoo_line}"
     )
 
 
 def build_trade_keyboard(symbol: str) -> InlineKeyboardMarkup:
-    # Map MEXC symbol → Yahoo ticker (for stocks only; indices/others get no Yahoo button)
-    YAHOO_MAP: dict[str, str] = {
-        "TSLASTOCK_USDT": "TSLA", "NVDASTOCK_USDT": "NVDA", "AAPLSTOCK_USDT": "AAPL",
-        "MSFTSTOCK_USDT": "MSFT", "AMZNSTOCK_USDT": "AMZN", "METASTOCK_USDT": "META",
-        "AMDSTOCK_USDT":  "AMD",  "GOOGLSTOCK_USDT": "GOOGL", "COINBASE_USDT": "COIN",
-        "CVNASTOCK_USDT": "CVNA", "AMATSTOCK_USDT": "AMAT",  "QCOMSTOCK_USDT": "QCOM",
-        "CRMSTOCK_USDT":  "CRM",  "SHOPSTOCK_USDT": "SHOP",  "VZSTOCK_USDT":   "VZ",
-        "INTCSTOCK_USDT": "INTC", "QQQSTOCK_USDT":  "QQQ",   "CSCOSTOCK_USDT": "CSCO",
-        "JNJSTOCK_USDT":  "JNJ",  "FUTUSTOCK_USDT": "FUTU",  "XOMSTOCK_USDT":  "XOM",
-        "RDDTSTOCK_USDT": "RDDT", "SPOTSTOCK_USDT": "SPOT",  "NFLXSTOCK_USDT": "NFLX",
-        "SMCISTOCK_USDT": "SMCI", "ORCLSTOCK_USDT": "ORCL",  "ASMLSTOCK_USDT": "ASML",
-        "ACNSTOCK_USDT":  "ACN",  "UNHSTOCK_USDT":  "UNH",   "NOWSTOCK_USDT":  "NOW",
-        "LLYSTOCK_USDT":  "LLY",  "LRCXSTOCK_USDT": "LRCX",  "IBMSTOCK_USDT":  "IBM",
-        "COSTSTOCK_USDT": "COST", "JDSTOCK_USDT":   "JD",    "JPMSTOCK_USDT":  "JPM",
-        "GSSTOCK_USDT":   "GS",   "MASTOCK_USDT":   "MA",    "KOSTOCK_USDT":   "KO",
-        "WMTSTOCK_USDT":  "WMT",  "GESTOCK_USDT":   "GE",    "MUSTOCK_USDT":   "MU",
-        "VSTOCK_USDT":    "V",    "NKESTOCK_USDT":  "NKE",   "PEPSTOCK_USDT":  "PEP",
-        "BASTOCK_USDT":   "BA",   "ROBINHOOD_USDT": "HOOD",  "FIGSTOCK_USDT":  "FIG",
-    }
     yahoo_ticker = YAHOO_MAP.get(symbol)
     buttons = [
         InlineKeyboardButton(
@@ -368,7 +446,18 @@ async def send_surge_alert(
     chat_id: Optional[int] = None,
     is_test: bool = False,
 ) -> None:
-    text = build_surge_message(symbol, pct_change, current_price, price_type, elapsed_seconds, is_test)
+    # Fetch Yahoo price in thread so we don't block the event loop
+    yahoo_price: Optional[float] = None
+    yahoo_ticker = YAHOO_MAP.get(symbol)
+    if yahoo_ticker:
+        try:
+            loop = asyncio.get_event_loop()
+            yahoo_price = await loop.run_in_executor(None, _fetch_yahoo_price, yahoo_ticker)
+        except Exception:
+            pass
+
+    text     = build_surge_message(symbol, pct_change, current_price, price_type,
+                                   elapsed_seconds, yahoo_price, is_test)
     keyboard = build_trade_keyboard(symbol)
     if chat_id:
         try:
@@ -1159,6 +1248,10 @@ async def main() -> None:
         THREAD_ID or "NOT SET",
         len(subscribers),
     )
+
+    # Init Yahoo crumb in background (non-blocking)
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, _refresh_yahoo_crumb)
 
     # Verify we can actually reach the thread at startup
     if CHANNEL_ID:
