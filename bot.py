@@ -393,6 +393,9 @@ ws_state: dict = {
     "errors":        deque(maxlen=10),
 }
 
+# Live WS handle shared with listing_rescanner for hot-subscribe
+_live_ws: Optional[object] = None
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -780,6 +783,7 @@ async def process_depth_update(bot: Bot, symbol: str, data: dict) -> None:
 
 async def ws_loop(bot: Bot) -> None:
     """Maintains a persistent WS connection with auto-reconnect."""
+    global _live_ws
     backoff = 5
     sub_session = aiohttp.ClientSession()
     try:
@@ -793,6 +797,7 @@ async def ws_loop(bot: Bot) -> None:
                     autoping=True,
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as ws:
+                    _live_ws                 = ws
                     ws_state["connected"]    = True
                     ws_state["connect_time"] = time.time()
                     ws_state["msg_count"]    = 0
@@ -857,10 +862,12 @@ async def ws_loop(bot: Bot) -> None:
                 continue
 
             # Clean exit from `async with` → reconnect
+            _live_ws               = None
             ws_state["connected"]  = False
             ws_state["reconnects"] += 1
             await asyncio.sleep(2)
     finally:
+        _live_ws = None
         await sub_session.close()
 
 
@@ -919,6 +926,71 @@ async def bootstrap_symbols(session: aiohttp.ClientSession) -> None:
                 len(MONITORED_SYMBOLS), len(HARDCODED_SYMBOLS), len(not_found))
     if not_found:
         logger.warning("Not found on MEXC: %s", ", ".join(sorted(not_found)))
+
+
+# ---------------------------------------------------------------------------
+# Periodic new-listing discovery (every 15 minutes)
+# ---------------------------------------------------------------------------
+
+
+def _derive_display(sym: str) -> str:
+    """Infer a short display ticker from a MEXC symbol.
+    AAPLSTOCK_USDT → AAPL  |  COINBASE_USDT → COINBASE  |  NAS100_USDT → NAS100
+    """
+    base = sym.split("_")[0]
+    return base[:-5] if base.upper().endswith("STOCK") else base
+
+
+async def listing_rescanner(bot: Bot) -> None:
+    """Every 15 minutes fetch all MEXC tickers and auto-subscribe new STOCK_USDT contracts."""
+    await asyncio.sleep(120)  # let WS fully settle before first scan
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                raw = await fetch_raw_tickers(session)
+                if raw:
+                    api_syms = {t.get("symbol", "") for t in raw}
+                    new_syms = sorted(
+                        s for s in api_syms
+                        if s not in MONITORED_SYMBOLS
+                        and s.endswith("_USDT")
+                        and "STOCK" in s.split("_")[0].upper()
+                    )
+                    if new_syms:
+                        for sym in new_syms:
+                            display = _derive_display(sym)
+                            HARDCODED_SYMBOLS[sym] = display
+                            MONITORED_SYMBOLS.add(sym)
+                            trackers[sym]    = FluxTracker()
+                            depth_books[sym] = DepthBook()
+                            lws = _live_ws
+                            if lws is not None:
+                                try:
+                                    await lws.send_json({
+                                        "method": "sub.depth.full",
+                                        "param": {"symbol": sym, "limit": 5},
+                                    })
+                                    ws_state["subscribed"] += 1
+                                except Exception as exc:
+                                    logger.warning("WS hot-sub %s failed: %s", sym, exc)
+
+                        # Refresh contract sizes for new symbols
+                        await fetch_contract_sizes(session)
+
+                        lines = "\n".join(
+                            f"  • <b>${_derive_display(s)}</b>  <code>{s}</code>" for s in new_syms
+                        )
+                        msg = f"🆕 <b>{len(new_syms)} new MEXC listing(s) added:</b>\n{lines}"
+                        logger.info("listing_rescanner: added %s", ", ".join(new_syms))
+                        try:
+                            await bot.send_message(chat_id=ADMIN_ID, text=msg, parse_mode="HTML")
+                        except Exception as exc:
+                            logger.warning("Admin DM (new listing): %s", exc)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("listing_rescanner error: %s", exc)
+            await asyncio.sleep(900)  # 15 minutes
 
 
 # ---------------------------------------------------------------------------
@@ -1861,11 +1933,12 @@ async def main() -> None:
 
     ws_task       = asyncio.create_task(ws_loop(bot))
     automute_task = asyncio.create_task(auto_mute_scheduler(bot))
+    rescan_task   = asyncio.create_task(listing_rescanner(bot))
 
     try:
         await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     finally:
-        for t in (ws_task, automute_task):
+        for t in (ws_task, automute_task, rescan_task):
             t.cancel()
             try:
                 await t
