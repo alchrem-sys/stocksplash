@@ -51,7 +51,6 @@ flux_count:      int   = int(  os.getenv("FLUX_COUNT",      "4"))
 flux_window:     int   = int(  os.getenv("FLUX_WINDOW",     "60"))
 depth_range_pct: float = float(os.getenv("DEPTH_RANGE_PCT", "0.20"))
 depth_min_vol:   float = float(os.getenv("DEPTH_MIN_VOL",   "10000"))
-COOLDOWN_SECONDS: int  = int(  os.getenv("COOLDOWN_SECONDS","60"))
 
 ADMIN_ID = 868931721
 
@@ -287,7 +286,6 @@ class DepthBook:
 MONITORED_SYMBOLS: set[str] = set()
 trackers:        dict[str, FluxTracker] = {}
 depth_books:     dict[str, DepthBook]   = {}
-last_alert:      dict[str, float]       = {}
 contract_sizes:  dict[str, float]       = {}  # symbol → contractSize (e.g. 0.01 for AAPL)
 
 symbols_discovered: bool = False
@@ -582,8 +580,6 @@ async def process_depth_update(bot: Bot, symbol: str, data: dict) -> None:
     if count < target:
         return
 
-    if now - last_alert.get(symbol, 0.0) < COOLDOWN_SECONDS:
-        return
     if is_muted() and not test_mode:
         return
 
@@ -602,7 +598,6 @@ async def process_depth_update(bot: Bot, symbol: str, data: dict) -> None:
         test_mode = False
         target_chat = test_chat_id  # always DM the requester for /test
 
-    last_alert[symbol] = now
     tr.events.clear()
 
     asyncio.create_task(
@@ -1081,10 +1076,6 @@ async def cmd_status(message: Message) -> None:
 
     now = time.time()
     with_data = sum(1 for tr in trackers.values() if tr.bid_marker > 0 or tr.ask_marker > 0)
-    on_cooldown = sum(
-        1 for sym in MONITORED_SYMBOLS
-        if now - last_alert.get(sym, 0) < COOLDOWN_SECONDS
-    )
 
     movers = []
     for symbol, tr in trackers.items():
@@ -1117,7 +1108,6 @@ async def cmd_status(message: Message) -> None:
         f"(subs <b>{ws_state['subscribed']}</b>, msgs <b>{ws_state['msg_count']}</b>)\n"
         f"🔍 Symbols watched: <b>{len(MONITORED_SYMBOLS)}</b>\n"
         f"📈 With data: <b>{with_data}/{len(MONITORED_SYMBOLS)}</b>\n"
-        f"🔕 On cooldown: <b>{on_cooldown}</b>\n"
         f"⚡ Threshold: <b>{flux_pct}%</b>  Count: <b>{flux_count}</b>  Window: <b>{flux_window}s</b>\n"
         f"📚 Depth filter: top-3 ≥<b>${depth_min_vol:.0f}</b> USD, spread ≤<b>{depth_range_pct}%</b>"
         f"{admin_extra}\n\n"
@@ -1351,8 +1341,7 @@ async def cmd_debugconfig(message: Message) -> None:
         f"FLUX_COUNT:  <code>{flux_count}</code>\n"
         f"FLUX_WINDOW: <code>{flux_window}s</code>\n"
         f"DEPTH_RANGE: <code>{depth_range_pct}%</code>\n"
-        f"DEPTH_VOL:   <code>{depth_min_vol:.0f}</code>\n"
-        f"COOLDOWN:    <code>{COOLDOWN_SECONDS}s</code>"
+        f"DEPTH_VOL:   <code>${depth_min_vol:.0f}</code>"
     )
 
 
