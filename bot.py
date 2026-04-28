@@ -273,6 +273,11 @@ class FluxTracker:
     bid_marker: float = 0.0
     ask_marker: float = 0.0
     events: deque = field(default_factory=deque)  # list[float] timestamps
+    total_flux: int   = 0       # lifetime fluctuations seen
+    total_alerts: int = 0       # lifetime alerts sent
+    blocks: dict      = field(default_factory=dict)  # reason → count
+    last_block:  str  = ""
+    last_block_ts: float = 0.0
 
 
 @dataclass
@@ -420,12 +425,14 @@ def update_flux(symbol: str, now: float, bid1: float, ask1: float) -> int:
     elif abs(bid1 - tr.bid_marker) / tr.bid_marker * 100.0 >= flux_pct:
         tr.events.append(now)
         tr.bid_marker = bid1
+        tr.total_flux += 1
 
     if tr.ask_marker <= 0:
         tr.ask_marker = ask1
     elif abs(ask1 - tr.ask_marker) / tr.ask_marker * 100.0 >= flux_pct:
         tr.events.append(now)
         tr.ask_marker = ask1
+        tr.total_flux += 1
 
     cutoff = now - flux_window
     while tr.events and tr.events[0] < cutoff:
@@ -583,14 +590,19 @@ async def process_depth_update(bot: Bot, symbol: str, data: dict) -> None:
     if is_muted() and not test_mode:
         return
 
+    tr = trackers[symbol]
     if not test_mode:
         passes, reason = passes_depth_filter(symbol, book)
         if not passes:
-            logger.debug("flux %s blocked by depth filter: %s", symbol, reason)
+            short = reason.split(" ")[0]  # e.g. "bid1" / "bid" / "ask1" / "depth"
+            tr.blocks[short]    = tr.blocks.get(short, 0) + 1
+            tr.last_block       = reason
+            tr.last_block_ts    = now
+            logger.info("flux %s would-fire but blocked: %s", symbol, reason)
             return
 
-    tr = trackers[symbol]
     span = (now - tr.events[0]) if tr.events else 0.0
+    tr.total_alerts += 1
 
     is_test = test_mode
     target_chat = None
@@ -881,6 +893,7 @@ async def cmd_help(message: Message) -> None:
             "/window 60 — rolling window seconds\n"
             "/depthrange 0.20 — max top-3 spread %%\n"
             "/depthvol 10000 — min USD per level (top-3 each side)\n"
+            "/debugflux [TICKER] — show why alerts (don't) fire\n"
             "/wsstatus — verify the websocket feed\n"
             "/mute 30 — mute ALL alerts for N minutes\n"
             "/unmute — unmute immediately\n"
@@ -1444,6 +1457,93 @@ async def cmd_book(message: Message, bot: Bot) -> None:
         f"   ─────────\n"
         f"<b>Bids</b>\n" + ("\n".join(bid_rows) if bid_rows else "  (none)") + "\n\n"
         f"<i>USD = size × contractSize × price</i>"
+    )
+
+
+@router.message(Command("debugflux"))
+async def cmd_debugflux(message: Message, bot: Bot) -> None:
+    """Show fluctuation + filter-block stats. /debugflux for top symbols, or /debugflux SYMBOL for one."""
+    args = (message.text or "").split()[1:]
+
+    if args:
+        sym = find_symbol(args[0])
+        if not sym:
+            await reply(message, f"❌ <code>{args[0].upper()}</code> not in monitored list.")
+            return
+        tr   = trackers.get(sym)
+        book = depth_books.get(sym)
+        if not tr:
+            await reply(message, "no tracker yet")
+            return
+        now      = time.time()
+        in_win   = len(tr.events)
+        block_lines = "\n".join(
+            f"  • <code>{k}</code>: {v}" for k, v in sorted(tr.blocks.items(), key=lambda x: -x[1])
+        ) or "  (none)"
+        last_block_age = (now - tr.last_block_ts) if tr.last_block_ts else None
+        last_block_str = (
+            f"\n<b>Last block</b> ({last_block_age:.0f}s ago): <code>{tr.last_block}</code>"
+            if tr.last_block else ""
+        )
+        book_line = ""
+        if book and book.bids and book.asks:
+            cs = contract_sizes.get(sym, 1.0)
+            b_usds = [_level_usd(sym, float(l[0]), float(l[1])) for l in book.bids[:3]]
+            a_usds = [_level_usd(sym, float(l[0]), float(l[1])) for l in book.asks[:3]]
+            bid1, bid3 = float(book.bids[0][0]), float(book.bids[2][0])
+            ask1, ask3 = float(book.asks[0][0]), float(book.asks[2][0])
+            b_spread = (bid1 - bid3) / bid1 * 100 if bid1 else 0
+            a_spread = (ask3 - ask1) / ask1 * 100 if ask1 else 0
+            book_line = (
+                f"\n<b>Live book (top-3 USD)</b>\n"
+                f"  bid: " + " / ".join(f"${u:,.0f}" for u in b_usds) + f"   spread {b_spread:.3f}%\n"
+                f"  ask: " + " / ".join(f"${u:,.0f}" for u in a_usds) + f"   spread {a_spread:.3f}%"
+            )
+        await reply(message,
+            f"🔬 <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b>  <code>{sym}</code>\n"
+            f"flux in window: <b>{in_win}/{flux_count}</b>\n"
+            f"lifetime fluxes: <b>{tr.total_flux}</b>   alerts sent: <b>{tr.total_alerts}</b>\n"
+            f"bid_marker <code>{tr.bid_marker}</code>   ask_marker <code>{tr.ask_marker}</code>\n"
+            f"\n<b>Filter blocks</b>\n{block_lines}"
+            f"{last_block_str}"
+            f"{book_line}"
+        )
+        return
+
+    # No arg: aggregate top blockers + most-fluctuating symbols
+    now = time.time()
+    by_alerts = sorted(trackers.items(), key=lambda kv: -kv[1].total_alerts)[:5]
+    by_flux   = sorted(trackers.items(), key=lambda kv: -kv[1].total_flux)[:5]
+    total_blocks: dict[str, int] = {}
+    total_alerts = 0
+    total_fluxes = 0
+    for tr in trackers.values():
+        total_alerts += tr.total_alerts
+        total_fluxes += tr.total_flux
+        for k, v in tr.blocks.items():
+            total_blocks[k] = total_blocks.get(k, 0) + v
+
+    blockers = "\n".join(
+        f"  • <code>{k}</code>: {v}" for k, v in sorted(total_blocks.items(), key=lambda x: -x[1])
+    ) or "  (none)"
+
+    flux_top = "\n".join(
+        f"  • <b>{HARDCODED_SYMBOLS.get(s, s)}</b>: {tr.total_flux} fluxes, {tr.total_alerts} alerts"
+        for s, tr in by_flux if tr.total_flux > 0
+    ) or "  (none yet)"
+
+    alert_top = "\n".join(
+        f"  • <b>{HARDCODED_SYMBOLS.get(s, s)}</b>: {tr.total_alerts}"
+        for s, tr in by_alerts if tr.total_alerts > 0
+    ) or "  (none yet)"
+
+    await reply(message,
+        f"🔬 <b>Flux debug — global</b>\n"
+        f"Lifetime: <b>{total_fluxes}</b> fluxes, <b>{total_alerts}</b> alerts\n\n"
+        f"<b>Filter blocks (all symbols)</b>\n{blockers}\n\n"
+        f"<b>Top by fluxes</b>\n{flux_top}\n\n"
+        f"<b>Top by alerts</b>\n{alert_top}\n\n"
+        f"<i>Use</i> <code>/debugflux AAPL</code> <i>for one symbol.</i>"
     )
 
 
