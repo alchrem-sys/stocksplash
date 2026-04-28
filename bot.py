@@ -1,6 +1,11 @@
 """
-MEXC Futures Price Surge Monitor Bot
-Version: 8.1.0 — bid1/ask1 based movement detection
+MEXC Futures Fluctuation Monitor Bot
+Version: 9.0.0 — WS depth-based fluctuation counter
+  - Real-time WS feed (sub.depth.full) for sub-second latency
+  - Counts ≥0.15% bid1/ask1 moves as fluctuations
+  - Alerts when ≥4 fluctuations land within 60s
+  - Filter: bid1/2/3 and ask1/2/3 each ≥ 10k volume,
+            top-3 prices on each side within 0.20% range
 """
 
 import asyncio
@@ -8,10 +13,8 @@ import json
 import logging
 import os
 import time
-import threading
-import requests as _requests
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -36,24 +39,25 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("mexc_surge_bot")
+logger = logging.getLogger("mexc_flux_bot")
 
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing from .env file")
 
-FETCH_INTERVAL: float = float(os.getenv("FETCH_INTERVAL", "2"))
-WINDOW_SECONDS: int = int(os.getenv("WINDOW_SECONDS", "60"))
-COOLDOWN_SECONDS: int = int(os.getenv("COOLDOWN_SECONDS", "60"))
-CHANNEL_ID: str = os.getenv("CHANNEL_ID", "") or os.getenv("CHAT_ID", "")
-THREAD_ID: Optional[int] = int(os.getenv("THREAD_ID", "0")) or None
-
-# Runtime-adjustable threshold (changed via /threshold command)
-surge_threshold: float = float(os.getenv("SURGE_THRESHOLD", "1.0"))
+# Tunables (env-overridable, runtime-adjustable via commands)
+flux_pct:        float = float(os.getenv("FLUX_PCT",        "0.15"))
+flux_count:      int   = int(  os.getenv("FLUX_COUNT",      "4"))
+flux_window:     int   = int(  os.getenv("FLUX_WINDOW",     "60"))
+depth_range_pct: float = float(os.getenv("DEPTH_RANGE_PCT", "0.20"))
+depth_min_vol:   float = float(os.getenv("DEPTH_MIN_VOL",   "10000"))
+COOLDOWN_SECONDS: int  = int(  os.getenv("COOLDOWN_SECONDS","60"))
 
 ADMIN_ID = 868931721
 
+WS_URL          = "wss://contract.mexc.com/edge"
 MEXC_TICKER_URL = "https://futures.mexc.com/api/v1/contract/ticker"
+DEPTH_URL_FMT   = "https://contract.mexc.com/api/v1/contract/depth/{symbol}?limit=5"
 
 HEADERS = {
     "User-Agent": (
@@ -64,166 +68,108 @@ HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://futures.mexc.com/",
-    "Origin": "https://futures.mexc.com",
+    "Origin":  "https://futures.mexc.com",
 }
 
 # ---------------------------------------------------------------------------
-# Yahoo Finance — cookie/crumb fetch (same as spread bot)
+# Symbol list — verified live on MEXC futures API
 # ---------------------------------------------------------------------------
-
-_yahoo_session = _requests.Session()
-_yahoo_crumb:  Optional[str] = None
-_yahoo_cookie: Optional[str] = None
-_crumb_lock    = threading.Lock()
-
-_YAHOO_HEADERS = {
-    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection":      "keep-alive",
-}
-
-# MEXC symbol → Yahoo ticker (stocks only)
-YAHOO_MAP: dict[str, str] = {
-    "TSLASTOCK_USDT": "TSLA", "NVDASTOCK_USDT": "NVDA", "AAPLSTOCK_USDT": "AAPL",
-    "MSFTSTOCK_USDT": "MSFT", "AMZNSTOCK_USDT": "AMZN", "METASTOCK_USDT": "META",
-    "AMDSTOCK_USDT":  "AMD",  "GOOGLSTOCK_USDT": "GOOGL", "COINBASE_USDT": "COIN",
-    "CVNASTOCK_USDT": "CVNA", "AMATSTOCK_USDT": "AMAT",  "QCOMSTOCK_USDT": "QCOM",
-    "CRMSTOCK_USDT":  "CRM",  "SHOPSTOCK_USDT": "SHOP",  "VZSTOCK_USDT":   "VZ",
-    "INTCSTOCK_USDT": "INTC", "QQQSTOCK_USDT":  "QQQ",   "CSCOSTOCK_USDT": "CSCO",
-    "JNJSTOCK_USDT":  "JNJ",  "FUTUSTOCK_USDT": "FUTU",  "XOMSTOCK_USDT":  "XOM",
-    "RDDTSTOCK_USDT": "RDDT", "SPOTSTOCK_USDT": "SPOT",  "NFLXSTOCK_USDT": "NFLX",
-    "SMCISTOCK_USDT": "SMCI", "ORCLSTOCK_USDT": "ORCL",  "ASMLSTOCK_USDT": "ASML",
-    "ACNSTOCK_USDT":  "ACN",  "UNHSTOCK_USDT":  "UNH",   "NOWSTOCK_USDT":  "NOW",
-    "LLYSTOCK_USDT":  "LLY",  "LRCXSTOCK_USDT": "LRCX",  "IBMSTOCK_USDT":  "IBM",
-    "COSTSTOCK_USDT": "COST", "JDSTOCK_USDT":   "JD",    "JPMSTOCK_USDT":  "JPM",
-    "GSSTOCK_USDT":   "GS",   "MASTOCK_USDT":   "MA",    "KOSTOCK_USDT":   "KO",
-    "WMTSTOCK_USDT":  "WMT",  "GESTOCK_USDT":   "GE",    "MUSTOCK_USDT":   "MU",
-    "VSTOCK_USDT":    "V",    "NKESTOCK_USDT":  "NKE",   "PEPSTOCK_USDT":  "PEP",
-    "BASTOCK_USDT":   "BA",   "ROBINHOOD_USDT": "HOOD",  "FIGSTOCK_USDT":  "FIG",
-}
-
-
-def _refresh_yahoo_crumb() -> bool:
-    global _yahoo_crumb, _yahoo_cookie
-    try:
-        r = _yahoo_session.get("https://finance.yahoo.com", headers=_YAHOO_HEADERS, timeout=10)
-        if "consent" in r.url:
-            _yahoo_session.post(
-                "https://consent.yahoo.com/v2/collectConsent",
-                data={"agree": ["agree"], "consentUUID": "default", "sessionId": "default"},
-                headers=_YAHOO_HEADERS, timeout=10,
-            )
-        r2 = _yahoo_session.get(
-            "https://query1.finance.yahoo.com/v1/test/getcrumb",
-            headers={**_YAHOO_HEADERS, "Accept": "text/plain"}, timeout=10,
-        )
-        if r2.status_code == 200 and r2.text and len(r2.text) < 50:
-            _yahoo_crumb  = r2.text.strip()
-            _yahoo_cookie = "; ".join(f"{k}={v}" for k, v in _yahoo_session.cookies.items())
-            logger.info("Yahoo crumb OK")
-            return True
-        return False
-    except Exception as exc:
-        logger.error("Yahoo crumb error: %s", exc)
-        return False
-
-
-def _fetch_yahoo_price(ticker: str) -> Optional[float]:
-    """Fetch current price for a single ticker. Returns None on failure."""
-    global _yahoo_crumb
-    with _crumb_lock:
-        if not _yahoo_crumb:
-            _refresh_yahoo_crumb()
-    try:
-        resp = _yahoo_session.get(
-            "https://query1.finance.yahoo.com/v7/finance/quote",
-            params={
-                "symbols": ticker,
-                "fields":  "regularMarketPrice,preMarketPrice,postMarketPrice,marketState,regularMarketTime,postMarketTime,preMarketTime",
-                "crumb":   _yahoo_crumb or "",
-            },
-            headers={**_YAHOO_HEADERS, "Cookie": _yahoo_cookie or ""},
-            timeout=8,
-        )
-        if resp.status_code in (401, 403):
-            with _crumb_lock:
-                _refresh_yahoo_crumb()
-            return None
-        results = resp.json().get("quoteResponse", {}).get("result", [])
-        if not results:
-            return None
-        q = results[0]
-        # Use same timestamp logic as spread bot
-        reg_price  = float(q.get("regularMarketPrice") or 0) or None
-        pre_price  = float(q.get("preMarketPrice")     or 0) or None
-        post_price = float(q.get("postMarketPrice")    or 0) or None
-        reg_time   = int(q.get("regularMarketTime")    or 0)
-        pre_time   = int(q.get("preMarketTime")        or 0)
-        post_time  = int(q.get("postMarketTime")       or 0)
-        if post_price and post_time > reg_time:
-            return post_price
-        if pre_price and pre_time > reg_time:
-            return pre_price
-        return reg_price
-    except Exception as exc:
-        logger.warning("Yahoo price fetch error for %s: %s", ticker, exc)
-        return None
 
 HARDCODED_SYMBOLS: dict[str, str] = {
-    "NAS100_USDT":     "NAS100",
-    "HK50_USDT":       "HK50",
-    "US30_USDT":       "US30",
-    "SP500_USDT":      "SP500",
-    "COINBASE_USDT":   "COIN",
-    "FIGSTOCK_USDT":   "FIG",
-    "ROBINHOOD_USDT":  "HOOD",
-    "TSLASTOCK_USDT":  "TSLA",
-    "NVDASTOCK_USDT":  "NVDA",
-    "CVNASTOCK_USDT":  "CVNA",
-    "AMATSTOCK_USDT":  "AMAT",
-    "GOOGLSTOCK_USDT": "GOOGL",
-    "QCOMSTOCK_USDT":  "QCOM",
-    "CRMSTOCK_USDT":   "CRM",
-    "SHOPSTOCK_USDT":  "SHOP",
-    "MSFTSTOCK_USDT":  "MSFT",
-    "VZSTOCK_USDT":    "VZ",
-    "INTCSTOCK_USDT":  "INTC",
-    "QQQSTOCK_USDT":   "QQQ",
-    "CSCOSTOCK_USDT":  "CSCO",
-    "JNJSTOCK_USDT":   "JNJ",
-    "AMZNSTOCK_USDT":  "AMZN",
-    "FUTUSTOCK_USDT":  "FUTU",
-    "AAPLSTOCK_USDT":  "AAPL",
-    "AMDSTOCK_USDT":   "AMD",
-    "XOMSTOCK_USDT":   "XOM",
-    "METASTOCK_USDT":  "META",
-    "RDDTSTOCK_USDT":  "RDDT",
-    "SPOTSTOCK_USDT":  "SPOT",
-    "NFLXSTOCK_USDT":  "NFLX",
-    "SMCISTOCK_USDT":  "SMCI",
-    "ORCLSTOCK_USDT":  "ORCL",
-    "ASMLSTOCK_USDT":  "ASML",
-    "ACNSTOCK_USDT":   "ACN",
-    "UNHSTOCK_USDT":   "UNH",
-    "NOWSTOCK_USDT":   "NOW",
-    "LLYSTOCK_USDT":   "LLY",
-    "LRCXSTOCK_USDT":  "LRCX",
-    "IBMSTOCK_USDT":   "IBM",
-    "COSTSTOCK_USDT":  "COST",
-    "JDSTOCK_USDT":    "JD",
-    "JPMSTOCK_USDT":   "JPM",
-    "GSSTOCK_USDT":    "GS",
-    "MASTOCK_USDT":    "MA",
-    "KOSTOCK_USDT":    "KO",
-    "WMTSTOCK_USDT":   "WMT",
-    "GESTOCK_USDT":    "GE",
-    "MUSTOCK_USDT":    "MU",
-    "VSTOCK_USDT":     "V",
-    "NKESTOCK_USDT":   "NKE",
-    "PEPSTOCK_USDT":   "PEP",
-    "BASTOCK_USDT":    "BA",
+    # Indices / ETFs
+    "NAS100_USDT":      "NAS100",
+    "US30_USDT":        "US30",
+    "HK50_USDT":        "HK50",
+    "JP225_USDT":       "JP225",
+    "EWY_USDT":         "EWY",
+    "SOXX_USDT":        "SOXX",
+    "QQQSTOCK_USDT":    "QQQ",
+
+    # Stocks
+    "AAPLSTOCK_USDT":   "AAPL",
+    "ABBVSTOCK_USDT":   "ABBV",
+    "ABTSTOCK_USDT":    "ABT",
+    "ACHRSTOCK_USDT":   "ACHR",
+    "ACNSTOCK_USDT":    "ACN",
+    "ALBSTOCK_USDT":    "ALB",
+    "AMATSTOCK_USDT":   "AMAT",
+    "AMDSTOCK_USDT":    "AMD",
+    "AMZNSTOCK_USDT":   "AMZN",
+    "ARMSTOCK_USDT":    "ARM",
+    "ASMLSTOCK_USDT":   "ASML",
+    "ASTSSTOCK_USDT":   "ASTS",
+    "BABASTOCK_USDT":   "BABA",
+    "BACSTOCK_USDT":    "BAC",
+    "BBAISTOCK_USDT":   "BBAI",
+    "COHRSTOCK_USDT":   "COHR",
+    "COINBASE_USDT":    "COIN",
+    "COPSTOCK_USDT":    "COP",
+    "CRMSTOCK_USDT":    "CRM",
+    "CRWDSTOCK_USDT":   "CRWD",
+    "CRWVSTOCK_USDT":   "CRWV",
+    "CSCOSTOCK_USDT":   "CSCO",
+    "CSTOCK_USDT":      "C",
+    "CVNASTOCK_USDT":   "CVNA",
+    "CVXSTOCK_USDT":    "CVX",
+    "FIGSTOCK_USDT":    "FIG",
+    "FUTUSTOCK_USDT":   "FUTU",
+    "GESTOCK_USDT":     "GE",
+    "GEVSTOCK_USDT":    "GEV",
+    "GOOGLSTOCK_USDT":  "GOOGL",
+    "GSSTOCK_USDT":     "GS",
+    "HIMSSTOCK_USDT":   "HIMS",
+    "IBMSTOCK_USDT":    "IBM",
+    "INTCSTOCK_USDT":   "INTC",
+    "INTUSTOCK_USDT":   "INTU",
+    "IONQSTOCK_USDT":   "IONQ",
+    "IRENSTOCK_USDT":   "IREN",
+    "JDSTOCK_USDT":     "JD",
+    "JPMSTOCK_USDT":    "JPM",
+    "KLACSTOCK_USDT":   "KLAC",
+    "KOSTOCK_USDT":     "KO",
+    "LINSTOCK_USDT":    "LIN",
+    "LLYSTOCK_USDT":    "LLY",
+    "LMTSTOCK_USDT":    "LMT",
+    "LRCXSTOCK_USDT":   "LRCX",
+    "MASTOCK_USDT":     "MA",
+    "MELISTOCK_USDT":   "MELI",
+    "METASTOCK_USDT":   "META",
+    "MRVLSTOCK_USDT":   "MRVL",
+    "MSFTSTOCK_USDT":   "MSFT",
+    "MSTRSTOCK_USDT":   "MSTR",
+    "MUSTOCK_USDT":     "MU",
+    "NBISSTOCK_USDT":   "NBIS",
+    "NFLXSTOCK_USDT":   "NFLX",
+    "NKESTOCK_USDT":    "NKE",
+    "NOWSTOCK_USDT":    "NOW",
+    "ONDSSTOCK_USDT":   "ONDS",
+    "ORCLSTOCK_USDT":   "ORCL",
+    "OXYSTOCK_USDT":    "OXY",
+    "PANWSTOCK_USDT":   "PANW",
+    "PDDSTOCK_USDT":    "PDD",
+    "PEPSTOCK_USDT":    "PEP",
+    "PGSTOCK_USDT":     "PG",
+    "PYPLSTOCK_USDT":   "PYPL",
+    "QCOMSTOCK_USDT":   "QCOM",
+    "RDDTSTOCK_USDT":   "RDDT",
+    "RKLBSTOCK_USDT":   "RKLB",
+    "ROBINHOOD_USDT":   "HOOD",
+    "RTXSTOCK_USDT":    "RTX",
+    "SHOPSTOCK_USDT":   "SHOP",
+    "SMCISTOCK_USDT":   "SMCI",
+    "SNDKSTOCK_USDT":   "SNDK",
+    "SNOWSTOCK_USDT":   "SNOW",
+    "SPOTSTOCK_USDT":   "SPOT",
+    "STXSTOCK_USDT":    "STX",
+    "TSMSTOCK_USDT":    "TSM",
+    "TXNSTOCK_USDT":    "TXN",
+    "UBERSTOCK_USDT":   "UBER",
+    "UNHSTOCK_USDT":    "UNH",
+    "VRTSTOCK_USDT":    "VRT",
+    "VZSTOCK_USDT":     "VZ",
+    "WFCSTOCK_USDT":    "WFC",
+    "WMTSTOCK_USDT":    "WMT",
+    "XOMSTOCK_USDT":    "XOM",
 }
 
 # ---------------------------------------------------------------------------
@@ -256,43 +202,48 @@ subscribers: dict[int, dict] = load_subscribers()
 # State
 # ---------------------------------------------------------------------------
 
-@dataclass
-class BookSnapshot:
-    ts:   float
-    bid1: float
-    ask1: float
-
 
 @dataclass
-class SplashTracker:
-    """
-    Tracks the lowest ask1 (for UP splash) and highest bid1 (for DOWN crash)
-    within a rolling 60-second window. Resets when the window expires.
-    """
-    # UP: track lowest ask1 → alert when ask1 rises >= threshold from floor
-    floor_price: float = 0.0   # lowest ask1 seen
-    floor_time:  float = 0.0   # when floor was set
+class FluxTracker:
+    """Per-symbol fluctuation state."""
+    bid_marker: float = 0.0
+    ask_marker: float = 0.0
+    events: deque = field(default_factory=deque)  # list[float] timestamps
 
-    # DOWN: track highest bid1 → alert when bid1 falls >= threshold from ceiling
-    ceil_price:  float = 0.0   # highest bid1 seen
-    ceil_time:   float = 0.0   # when ceiling was set
+
+@dataclass
+class DepthBook:
+    """Latest top-5 depth snapshot from sub.depth.full."""
+    bids: list = field(default_factory=list)  # [[price, vol, count], ...] descending
+    asks: list = field(default_factory=list)  # ascending
+    ts: float = 0.0
 
 
 MONITORED_SYMBOLS: set[str] = set()
-
-# New: one tracker per symbol
-trackers: dict[str, SplashTracker] = {}
-
-last_surge_alert: dict[str, float] = {}
-last_crash_alert: dict[str, float] = {}
+trackers:    dict[str, FluxTracker] = {}
+depth_books: dict[str, DepthBook]   = {}
+last_alert:  dict[str, float]       = {}
 
 symbols_discovered: bool = False
-test_mode: bool = False
+banned_symbols: set[str]        = set()
+frozen_symbols: dict[str, float] = {}
+muted_until:    float           = 0.0
+
+# Test mode (one-shot)
+test_mode:    bool          = False
 test_chat_id: Optional[int] = None
 
-banned_symbols: set[str] = set()
-frozen_symbols: dict[str, float] = {}
-muted_until: float = 0.0
+# WebSocket health for /wsstatus
+ws_state: dict = {
+    "connected":     False,
+    "connect_time":  0.0,
+    "last_msg_ts":   0.0,
+    "msg_count":     0,
+    "subscribed":    0,
+    "reconnects":    0,
+    "msgs_last_10s": deque(),
+    "errors":        deque(maxlen=10),
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -304,10 +255,6 @@ def is_admin(message: Message) -> bool:
 
 
 async def reply(message: Message, text: str, **kwargs) -> None:
-    """
-    Smart reply — always responds in the same thread the command came from.
-    Works for DMs, groups, and forum topic threads alike.
-    """
     thread_id = message.message_thread_id if message.is_topic_message else None
     await message.bot.send_message(
         chat_id=message.chat.id,
@@ -316,10 +263,6 @@ async def reply(message: Message, text: str, **kwargs) -> None:
         parse_mode="HTML",
         **kwargs,
     )
-
-
-async def deny(message: Message) -> None:
-    await reply(message, "⛔ You are not authorized to use this command.")
 
 
 def find_symbol(user_input: str) -> Optional[str]:
@@ -362,102 +305,162 @@ def mute_remaining() -> str:
 
 def discover_symbols(all_tickers: list[dict]) -> tuple[dict[str, str], list[str]]:
     api_symbol_set = {t.get("symbol", "") for t in all_tickers}
-    found: dict[str, str] = {}
-    not_found: list[str] = []
+    found:     dict[str, str] = {}
+    not_found: list[str]      = []
     for mexc_sym, base in HARDCODED_SYMBOLS.items():
         if mexc_sym in api_symbol_set:
             found[mexc_sym] = base
-            logger.info("Confirmed: %-10s -> %s", base, mexc_sym)
         else:
             not_found.append(base)
-            logger.warning("NOT IN API: %-10s (%s)", base, mexc_sym)
     return found, not_found
 
 
-# ---------------------------------------------------------------------------
-# Channel broadcast
-# ---------------------------------------------------------------------------
-
-
-async def broadcast(bot: Bot, text: str, keyboard: InlineKeyboardMarkup) -> None:
-    if not CHANNEL_ID:
-        logger.warning("CHANNEL_ID not set — alert not sent")
-        return
+async def fetch_raw_tickers(session: aiohttp.ClientSession) -> Optional[list[dict]]:
     try:
-        await bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=text,
-            reply_markup=keyboard,
-            message_thread_id=THREAD_ID,
-        )
-        logger.info("Alert posted to %s thread=%s", CHANNEL_ID, THREAD_ID)
+        async with session.get(
+            MEXC_TICKER_URL, headers=HEADERS,
+            timeout=aiohttp.ClientTimeout(total=30), ssl=True,
+        ) as response:
+            if response.status != 200:
+                logger.warning("HTTP %d from API", response.status)
+                return None
+            payload: dict = await response.json(content_type=None)
+            if not payload.get("success"):
+                logger.warning("API returned success=false")
+                return None
+            return payload.get("data") or None
+    except asyncio.TimeoutError:
+        logger.warning("Ticker request timed out")
+    except aiohttp.ClientConnectionError as exc:
+        logger.warning("Connection error: %s", exc)
     except Exception as exc:
-        logger.error("Failed to post to channel: %s", exc)
+        logger.error("Unexpected error: %s", exc, exc_info=True)
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Alert builders — CHANGED: show bid1/ask1 label and direction
+# Fluctuation logic
 # ---------------------------------------------------------------------------
 
 
-def build_surge_message(
+def update_flux(symbol: str, now: float, bid1: float, ask1: float) -> int:
+    """
+    Each ≥flux_pct move on bid1 OR ask1 (any direction) since the last marker
+    counts as one fluctuation; markers reset to current price after counting.
+    Returns the rolling count within flux_window.
+    """
+    tr = trackers.setdefault(symbol, FluxTracker())
+
+    if tr.bid_marker <= 0:
+        tr.bid_marker = bid1
+    elif abs(bid1 - tr.bid_marker) / tr.bid_marker * 100.0 >= flux_pct:
+        tr.events.append(now)
+        tr.bid_marker = bid1
+
+    if tr.ask_marker <= 0:
+        tr.ask_marker = ask1
+    elif abs(ask1 - tr.ask_marker) / tr.ask_marker * 100.0 >= flux_pct:
+        tr.events.append(now)
+        tr.ask_marker = ask1
+
+    cutoff = now - flux_window
+    while tr.events and tr.events[0] < cutoff:
+        tr.events.popleft()
+
+    return len(tr.events)
+
+
+def passes_depth_filter(book: DepthBook) -> tuple[bool, str]:
+    """All of bid1/2/3 and ask1/2/3 must each have vol ≥ depth_min_vol AND
+    the top-3 prices on each side must span ≤ depth_range_pct%."""
+    if len(book.bids) < 3 or len(book.asks) < 3:
+        return False, f"depth thin (b={len(book.bids)} a={len(book.asks)})"
+
+    for i, lvl in enumerate(book.bids[:3]):
+        if float(lvl[1]) < depth_min_vol:
+            return False, f"bid{i+1} vol {lvl[1]:.0f} < {depth_min_vol:.0f}"
+    for i, lvl in enumerate(book.asks[:3]):
+        if float(lvl[1]) < depth_min_vol:
+            return False, f"ask{i+1} vol {lvl[1]:.0f} < {depth_min_vol:.0f}"
+
+    bid1p, bid3p = float(book.bids[0][0]), float(book.bids[2][0])
+    ask1p, ask3p = float(book.asks[0][0]), float(book.asks[2][0])
+    bid_spread = (bid1p - bid3p) / bid1p * 100.0 if bid1p > 0 else 999.0
+    ask_spread = (ask3p - ask1p) / ask1p * 100.0 if ask1p > 0 else 999.0
+
+    if bid_spread > depth_range_pct:
+        return False, f"bid spread {bid_spread:.3f}% > {depth_range_pct:.2f}%"
+    if ask_spread > depth_range_pct:
+        return False, f"ask spread {ask_spread:.3f}% > {depth_range_pct:.2f}%"
+
+    return True, "ok"
+
+
+# ---------------------------------------------------------------------------
+# Alert
+# ---------------------------------------------------------------------------
+
+
+def build_flux_message(
     symbol: str,
-    pct_change: float,
-    current_price: float,
-    price_type: str,
-    elapsed_seconds: int = 0,
-    yahoo_price: Optional[float] = None,
+    count: int,
+    span: float,
+    bid1: float,
+    ask1: float,
     is_test: bool = False,
 ) -> str:
-    display  = HARDCODED_SYMBOLS.get(symbol, symbol.replace("_", ""))
-    sign     = "" if pct_change < 0 else "+"
-    header   = "🧪 <b>[TEST]</b> " if is_test else ""
-    yahoo_line = f"\nYahoo:  <b>${yahoo_price:.4f}</b>" if yahoo_price else ""
+    display = HARDCODED_SYMBOLS.get(symbol, symbol.replace("_", ""))
+    header  = "🧪 <b>[TEST]</b> " if is_test else "🚨 "
     return (
-        f"{header}<b>${display}</b>  {sign}{pct_change:.2f}%  +{elapsed_seconds}s\n"
-        f"MEXC:   <b>${current_price:.4f}</b>"
-        f"{yahoo_line}"
+        f"{header}<b>${display}</b>  {count} fluxes / {int(span)}s  (≥{flux_pct}%)\n"
+        f"MEXC bid <b>${bid1:.4f}</b>  ask <b>${ask1:.4f}</b>"
     )
 
 
 def build_trade_keyboard(symbol: str) -> InlineKeyboardMarkup:
-    yahoo_ticker = YAHOO_MAP.get(symbol)
-    buttons = [
+    return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
             text="📊 MEXC Futures",
-            url=f"https://futures.mexc.com/exchange/{symbol}"
+            url=f"https://futures.mexc.com/exchange/{symbol}",
         )
-    ]
-    if yahoo_ticker:
-        buttons.append(InlineKeyboardButton(
-            text="📈 Yahoo Finance",
-            url=f"https://finance.yahoo.com/quote/{yahoo_ticker}"
-        ))
-    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+    ]])
 
 
-async def send_surge_alert(
+async def broadcast_alert(bot: Bot, text: str, keyboard: InlineKeyboardMarkup) -> None:
+    """Fan-out an alert to every subscriber's DM with the bot."""
+    if not subscribers:
+        logger.info("No subscribers — alert not delivered")
+        return
+    sent, dead = 0, []
+    for chat_id in list(subscribers.keys()):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+            sent += 1
+            await asyncio.sleep(0.03)
+        except Exception as exc:
+            msg = str(exc).lower()
+            if any(x in msg for x in ("blocked", "not found", "deactivated", "user is deactivated")):
+                dead.append(chat_id)
+            else:
+                logger.warning("Alert send failed to %s: %s", chat_id, exc)
+    for cid in dead:
+        subscribers.pop(cid, None)
+    if dead:
+        save_subscribers()
+    logger.info("Alert fanned out: sent=%d dead=%d", sent, len(dead))
+
+
+async def send_flux_alert(
     bot: Bot,
     symbol: str,
-    pct_change: float,
-    current_price: float,
-    price_type: str = "bid1",
-    elapsed_seconds: int = 0,
-    chat_id: Optional[int] = None,
+    count: int,
+    span: float,
+    bid1: float,
+    ask1: float,
     is_test: bool = False,
+    chat_id: Optional[int] = None,
 ) -> None:
-    # Fetch Yahoo price in thread so we don't block the event loop
-    yahoo_price: Optional[float] = None
-    yahoo_ticker = YAHOO_MAP.get(symbol)
-    if yahoo_ticker:
-        try:
-            loop = asyncio.get_event_loop()
-            yahoo_price = await loop.run_in_executor(None, _fetch_yahoo_price, yahoo_ticker)
-        except Exception:
-            pass
-
-    text     = build_surge_message(symbol, pct_change, current_price, price_type,
-                                   elapsed_seconds, yahoo_price, is_test)
+    text     = build_flux_message(symbol, count, span, bid1, ask1, is_test)
     keyboard = build_trade_keyboard(symbol)
     if chat_id:
         try:
@@ -465,14 +468,306 @@ async def send_surge_alert(
         except Exception as exc:
             logger.error("Test alert failed: %s", exc)
     else:
-        await broadcast(bot, text, keyboard)
+        await broadcast_alert(bot, text, keyboard)
 
 
 # ---------------------------------------------------------------------------
-# Router
+# Process incoming depth pushes (the hot path)
+# ---------------------------------------------------------------------------
+
+
+async def process_depth_update(bot: Bot, symbol: str, data: dict) -> None:
+    global test_mode, test_chat_id
+
+    bids = data.get("bids") or []
+    asks = data.get("asks") or []
+    if not bids or not asks:
+        return
+
+    now = time.time()
+    book = depth_books.setdefault(symbol, DepthBook())
+    book.bids = bids
+    book.asks = asks
+    book.ts   = now
+
+    if symbol in banned_symbols:
+        return
+    if symbol in frozen_symbols and frozen_symbols[symbol] > now:
+        return
+
+    try:
+        bid1 = float(bids[0][0])
+        ask1 = float(asks[0][0])
+    except (IndexError, ValueError, TypeError):
+        return
+    if bid1 <= 0 or ask1 <= 0:
+        return
+
+    count = update_flux(symbol, now, bid1, ask1)
+
+    target = 1 if test_mode else flux_count
+    if count < target:
+        return
+
+    if now - last_alert.get(symbol, 0.0) < COOLDOWN_SECONDS:
+        return
+    if is_muted() and not test_mode:
+        return
+
+    passes, reason = passes_depth_filter(book)
+    if not passes:
+        logger.debug("flux %s blocked by depth filter: %s", symbol, reason)
+        return
+
+    tr = trackers[symbol]
+    span = (now - tr.events[0]) if tr.events else 0.0
+
+    is_test = test_mode
+    target_chat = None
+    if is_test:
+        test_mode = False
+        target_chat = test_chat_id  # always DM the requester for /test
+
+    last_alert[symbol] = now
+    tr.events.clear()
+
+    asyncio.create_task(
+        send_flux_alert(bot, symbol, count, span, bid1, ask1,
+                        is_test=is_test, chat_id=target_chat)
+    )
+
+
+# ---------------------------------------------------------------------------
+# WebSocket loop
+# ---------------------------------------------------------------------------
+
+
+async def ws_loop(bot: Bot) -> None:
+    """Maintains a persistent WS connection with auto-reconnect."""
+    backoff = 5
+    sub_session = aiohttp.ClientSession()
+    try:
+        while True:
+            try:
+                logger.info("WS connecting to %s", WS_URL)
+                ws_state["connected"] = False
+                async with sub_session.ws_connect(
+                    WS_URL,
+                    heartbeat=20,
+                    autoping=True,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as ws:
+                    ws_state["connected"]    = True
+                    ws_state["connect_time"] = time.time()
+                    ws_state["msg_count"]    = 0
+                    ws_state["subscribed"]   = 0
+                    ws_state["msgs_last_10s"].clear()
+                    backoff = 5
+                    logger.info("WS connected — subscribing to %d symbols", len(MONITORED_SYMBOLS))
+
+                    # Subscribe in small batches to be polite
+                    sent = 0
+                    for sym in sorted(MONITORED_SYMBOLS):
+                        try:
+                            await ws.send_json({
+                                "method": "sub.depth.full",
+                                "param": {"symbol": sym, "limit": 5},
+                            })
+                            sent += 1
+                            if sent % 10 == 0:
+                                await asyncio.sleep(0.25)
+                        except Exception as exc:
+                            logger.warning("WS sub %s failed: %s", sym, exc)
+                    ws_state["subscribed"] = sent
+                    logger.info("WS subscribed to %d symbols", sent)
+
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            now = time.time()
+                            ws_state["last_msg_ts"] = now
+                            ws_state["msg_count"]  += 1
+                            ws_state["msgs_last_10s"].append(now)
+                            cutoff = now - 10.0
+                            while ws_state["msgs_last_10s"] and ws_state["msgs_last_10s"][0] < cutoff:
+                                ws_state["msgs_last_10s"].popleft()
+
+                            try:
+                                data = json.loads(msg.data)
+                            except Exception:
+                                continue
+
+                            ch = data.get("channel")
+                            if ch == "push.depth.full":
+                                sym = data.get("symbol")
+                                d   = data.get("data") or {}
+                                if sym in MONITORED_SYMBOLS:
+                                    await process_depth_update(bot, sym, d)
+                            elif ch and ch.startswith("rs."):
+                                if data.get("data") != "success":
+                                    logger.warning("WS sub error: %s", data)
+                            # ignore pong, etc.
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            logger.warning("WS closed/error: %s", msg)
+                            break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                ws_state["connected"]  = False
+                ws_state["reconnects"] += 1
+                ws_state["errors"].append(f"{time.strftime('%H:%M:%S')} {type(exc).__name__}: {exc}")
+                logger.warning("WS error: %s — reconnect in %ds", exc, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+                continue
+
+            # Clean exit from `async with` → reconnect
+            ws_state["connected"]  = False
+            ws_state["reconnects"] += 1
+            await asyncio.sleep(2)
+    finally:
+        await sub_session.close()
+
+
+# ---------------------------------------------------------------------------
+# Symbol-discovery bootstrap (one-shot REST hit on startup)
+# ---------------------------------------------------------------------------
+
+
+async def bootstrap_symbols(session: aiohttp.ClientSession) -> None:
+    global symbols_discovered, MONITORED_SYMBOLS
+
+    raw = await fetch_raw_tickers(session)
+    if not raw:
+        logger.error("Symbol discovery failed — bot cannot start")
+        return
+
+    found, not_found = discover_symbols(raw)
+    MONITORED_SYMBOLS = set(found.keys())
+    for sym in MONITORED_SYMBOLS:
+        trackers[sym]    = FluxTracker()
+        depth_books[sym] = DepthBook()
+    symbols_discovered = True
+
+    logger.info("Bootstrap: %d/%d symbols matched (%d missing)",
+                len(MONITORED_SYMBOLS), len(HARDCODED_SYMBOLS), len(not_found))
+    if not_found:
+        logger.warning("Not found on MEXC: %s", ", ".join(sorted(not_found)))
+
+
+# ---------------------------------------------------------------------------
+# Auto-mute scheduler (unchanged)
+# ---------------------------------------------------------------------------
+
+
+async def _notify_subscribers(bot: Bot, text: str) -> None:
+    """Plain DM notification (no inline keyboard) to all subscribers."""
+    for chat_id in list(subscribers.keys()):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text)
+            await asyncio.sleep(0.03)
+        except Exception:
+            pass
+
+
+async def auto_mute_scheduler(bot: Bot) -> None:
+    global muted_until
+    last_muted:   dict[str, object] = {}
+    last_unmuted: dict[str, object] = {}
+    logger.info("Auto-mute scheduler started")
+
+    while True:
+        await asyncio.sleep(20)
+        try:
+            import datetime
+            now_utc = datetime.datetime.utcnow()
+            weekday = now_utc.weekday()
+            today   = now_utc.date()
+            h, m    = now_utc.hour, now_utc.minute
+            if weekday >= 5:
+                continue
+
+            windows = {
+                "00:00": {
+                    "active":    h == 0 and m < 5,
+                    "duration":  5 * 60,
+                    "mute_msg":  "🔇 <b>Auto-muted</b> — 00:00 UTC pause (5 min).",
+                    "unmute_h":  0, "unmute_m": 5,
+                    "unmute_msg": "🔊 <b>Auto-unmuted</b> — 00:05 UTC.",
+                },
+                "13:29": {
+                    "active":    (h == 13 and m >= 29) or (h == 14 and m < 30),
+                    "duration":  61 * 60,
+                    "mute_msg":  "🔇 <b>Auto-muted</b> — market open window (13:29–14:30 UTC).",
+                    "unmute_h":  14, "unmute_m": 30,
+                    "unmute_msg": "🔊 <b>Auto-unmuted</b> — market open window passed.",
+                },
+            }
+            for key, w in windows.items():
+                if w["active"] and last_muted.get(key) != today:
+                    muted_until         = time.time() + w["duration"]
+                    last_muted[key]     = today
+                    logger.info("Auto-mute: %s window", key)
+                    await _notify_subscribers(bot, w["mute_msg"])
+                elif (not w["active"]
+                      and last_muted.get(key) == today
+                      and last_unmuted.get(key) != today
+                      and h >= w["unmute_h"] and m >= w["unmute_m"]):
+                    muted_until          = 0.0
+                    last_unmuted[key]    = today
+                    logger.info("Auto-unmute: %s window passed", key)
+                    await _notify_subscribers(bot, w["unmute_msg"])
+        except Exception as exc:
+            logger.error("Auto-mute scheduler error: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Router / commands
 # ---------------------------------------------------------------------------
 
 router = Router()
+
+
+@router.message(Command("start"))
+async def cmd_start(message: Message) -> None:
+    user = message.from_user
+    if user is None or message.chat.type != "private":
+        await reply(message, "ℹ️ Open a private chat with the bot and send /start there to subscribe to alerts.")
+        return
+
+    chat_id = message.chat.id
+    name     = user.full_name or "—"
+    username = f"@{user.username}" if user.username else ""
+    if chat_id in subscribers:
+        await reply(message,
+            "✅ Already subscribed.\n"
+            "You'll receive alerts directly here. Use /stop to unsubscribe."
+        )
+        return
+
+    subscribers[chat_id] = {
+        "name":      name,
+        "username":  username,
+        "joined_at": int(time.time()),
+    }
+    save_subscribers()
+    await reply(message,
+        f"✅ <b>Subscribed!</b>\n"
+        f"You'll receive flux alerts here as DMs.\n\n"
+        f"⚙️ Default rules: {flux_count}× ≥{flux_pct}% within {flux_window}s, "
+        f"depth ≥{depth_min_vol:.0f} vol on top-3 levels, spread ≤{depth_range_pct}%.\n\n"
+        f"Use /help to see all commands. /stop to unsubscribe."
+    )
+
+
+@router.message(Command("stop"))
+async def cmd_stop(message: Message) -> None:
+    chat_id = message.chat.id
+    if chat_id not in subscribers:
+        await reply(message, "ℹ️ You weren't subscribed.")
+        return
+    subscribers.pop(chat_id, None)
+    save_subscribers()
+    await reply(message, "👋 Unsubscribed. Send /start any time to resume.")
 
 
 @router.message(Command("help"))
@@ -481,10 +776,15 @@ async def cmd_help(message: Message) -> None:
     if is_admin(message):
         admin_section = (
             "\n\n<b>🔐 Admin commands:</b>\n"
-            "/threshold 2.0 — set alert threshold (default 1%)\n"
+            "/threshold 0.15 — fluctuation %% (default 0.15)\n"
+            "/count 4 — required fluctuations (default 4)\n"
+            "/window 60 — rolling window seconds\n"
+            "/depthrange 0.20 — max top-3 spread %%\n"
+            "/depthvol 10000 — min volume per level\n"
+            "/wsstatus — verify the websocket feed\n"
             "/mute 30 — mute ALL alerts for N minutes\n"
             "/unmute — unmute immediately\n"
-            "/ban TSLA — permanently silence a ticker\n"
+            "/ban TSLA — silence a ticker permanently\n"
             "/unban TSLA — restore banned ticker\n"
             "/freeze TSLA 30 — silence ticker for N minutes\n"
             "/unfreeze TSLA — restore frozen ticker early\n"
@@ -492,47 +792,123 @@ async def cmd_help(message: Message) -> None:
             "/symbols — all monitored symbols with status\n"
             "/subscribers — list all subscribers\n"
             "/kick ID — remove a subscriber\n"
-            "/broadcast msg — send message to all subscribers\n"
+            "/broadcast msg — send to all subscribers\n"
             "/debug — raw API diagnostic\n"
-            "/test — test alert at 0.1% threshold\n"
+            "/test — fire a test alert at first 0.15%% wiggle\n"
         )
 
-    await reply(message, 
-        "<b>📖 MEXC Surge Monitor — Help</b>\n\n"
-        "<b>📊 Info commands:</b>\n"
-        "/status — live stats + top 5 movers\n"
+    await reply(message,
+        "<b>📖 MEXC Flux Monitor — Help</b>\n\n"
+        "<b>📊 Info:</b>\n"
+        "/start — subscribe to DM alerts\n"
+        "/stop — unsubscribe\n"
+        "/status — live stats\n"
         "/symbols — all monitored symbols\n"
-        "/help — show this message"
+        "/wsstatus — websocket health\n"
+        "/help — this message"
         f"{admin_section}\n\n"
         "<b>ℹ️ How it works:</b>\n"
-        f"Bot monitors {len(MONITORED_SYMBOLS)} futures symbols every 2s.\n"
-        f"📈 UP move → measured via <b>bid1</b>\n"
-        f"📉 DOWN move → measured via <b>ask1</b>\n"
-        f"Alerts fire when either moves ±{surge_threshold}% within {WINDOW_SECONDS}s.\n"
-        "🚨 = surge  🔴 = crash"
+        f"Watches {len(MONITORED_SYMBOLS)} MEXC futures via WebSocket depth.\n"
+        f"Each ≥{flux_pct}% move on bid1 OR ask1 = 1 fluctuation.\n"
+        f"When {flux_count} fluxes hit within {flux_window}s and the\n"
+        f"orderbook is liquid (top-3 each ≥{depth_min_vol:.0f} vol,\n"
+        f"top-3 prices within {depth_range_pct}%) → 🚨 alert sent to your DM."
     )
 
 
 @router.message(Command("threshold"))
 async def cmd_threshold(message: Message) -> None:
-    global surge_threshold
+    global flux_pct
     args = (message.text or "").split()[1:]
     if not args:
-        await reply(message, 
-            f"Current threshold: <b>±{surge_threshold}%</b>\n\n"
-            "Usage: <code>/threshold 2.0</code>"
-        )
+        await reply(message, f"Current fluctuation %: <b>{flux_pct}</b>\nUsage: <code>/threshold 0.15</code>")
         return
     try:
         new_val = float(args[0])
-        if new_val <= 0 or new_val > 100:
+        if new_val <= 0 or new_val > 10:
             raise ValueError
     except ValueError:
-        await reply(message, "❌ Must be a number between 0.1 and 100.")
+        await reply(message, "❌ Must be a number between 0.01 and 10.")
         return
-    old = surge_threshold
-    surge_threshold = new_val
-    await reply(message, f"✅ Threshold: <b>±{old}%</b> → <b>±{new_val}%</b>")
+    old = flux_pct
+    flux_pct = new_val
+    await reply(message, f"✅ Fluctuation %: <b>{old}</b> → <b>{new_val}</b>")
+
+
+@router.message(Command("count"))
+async def cmd_count(message: Message) -> None:
+    global flux_count
+    args = (message.text or "").split()[1:]
+    if not args:
+        await reply(message, f"Current count: <b>{flux_count}</b>\nUsage: <code>/count 4</code>")
+        return
+    try:
+        new_val = int(args[0])
+        if new_val < 2 or new_val > 50:
+            raise ValueError
+    except ValueError:
+        await reply(message, "❌ Must be an integer 2..50.")
+        return
+    old = flux_count
+    flux_count = new_val
+    await reply(message, f"✅ Count: <b>{old}</b> → <b>{new_val}</b>")
+
+
+@router.message(Command("window"))
+async def cmd_window(message: Message) -> None:
+    global flux_window
+    args = (message.text or "").split()[1:]
+    if not args:
+        await reply(message, f"Current window: <b>{flux_window}s</b>\nUsage: <code>/window 60</code>")
+        return
+    try:
+        new_val = int(args[0])
+        if new_val < 5 or new_val > 600:
+            raise ValueError
+    except ValueError:
+        await reply(message, "❌ Seconds must be 5..600.")
+        return
+    old = flux_window
+    flux_window = new_val
+    await reply(message, f"✅ Window: <b>{old}s</b> → <b>{new_val}s</b>")
+
+
+@router.message(Command("depthrange"))
+async def cmd_depthrange(message: Message) -> None:
+    global depth_range_pct
+    args = (message.text or "").split()[1:]
+    if not args:
+        await reply(message, f"Top-3 spread cap: <b>{depth_range_pct}%</b>\nUsage: <code>/depthrange 0.20</code>")
+        return
+    try:
+        new_val = float(args[0])
+        if new_val <= 0 or new_val > 5:
+            raise ValueError
+    except ValueError:
+        await reply(message, "❌ Must be 0.01..5.")
+        return
+    old = depth_range_pct
+    depth_range_pct = new_val
+    await reply(message, f"✅ Depth range: <b>{old}%</b> → <b>{new_val}%</b>")
+
+
+@router.message(Command("depthvol"))
+async def cmd_depthvol(message: Message) -> None:
+    global depth_min_vol
+    args = (message.text or "").split()[1:]
+    if not args:
+        await reply(message, f"Min vol per level: <b>{depth_min_vol:.0f}</b>\nUsage: <code>/depthvol 10000</code>")
+        return
+    try:
+        new_val = float(args[0])
+        if new_val < 0:
+            raise ValueError
+    except ValueError:
+        await reply(message, "❌ Must be a non-negative number.")
+        return
+    old = depth_min_vol
+    depth_min_vol = new_val
+    await reply(message, f"✅ Min vol: <b>{old:.0f}</b> → <b>{new_val:.0f}</b>")
 
 
 @router.message(Command("mute"))
@@ -549,10 +925,8 @@ async def cmd_mute(message: Message) -> None:
                 "<code>/mute TSLA 30</code> — mute TSLA specifically for 30 minutes")
         return
 
-    # Check if first arg is a ticker or a number
     ticker = find_symbol(args[0])
     if ticker:
-        # /mute TICKER MINUTES
         if len(args) < 2:
             await reply(message, f"Usage: <code>/mute {args[0].upper()} 30</code>")
             return
@@ -565,14 +939,12 @@ async def cmd_mute(message: Message) -> None:
             return
         frozen_symbols[ticker] = time.time() + minutes * 60
         display = HARDCODED_SYMBOLS.get(ticker, ticker)
-        h = int(minutes // 60)
-        m = int(minutes % 60)
+        h, m = int(minutes // 60), int(minutes % 60)
         await reply(message,
             f"🔇 <b>{display}</b> muted for <b>{'{}h {}m'.format(h,m) if h else '{}m'.format(m)}</b>\n"
             f"Use <code>/unfreeze {display}</code> to restore early.")
         return
 
-    # /mute MINUTES
     try:
         minutes = float(args[0])
         if minutes <= 0:
@@ -581,8 +953,7 @@ async def cmd_mute(message: Message) -> None:
         await reply(message, "❌ Unknown symbol or invalid number.")
         return
     muted_until = time.time() + minutes * 60
-    h = int(minutes // 60)
-    m = int(minutes % 60)
+    h, m = int(minutes // 60), int(minutes % 60)
     await reply(message, f"🔇 <b>Muted for {'{}h {}m'.format(h,m) if h else '{}m'.format(m)}</b>\nUse /unmute to restore.")
 
 
@@ -603,50 +974,90 @@ async def cmd_status(message: Message) -> None:
         return
 
     now = time.time()
-    windows_with_data = sum(1 for tr in trackers.values() if tr.floor_price > 0)
+    with_data = sum(1 for tr in trackers.values() if tr.bid_marker > 0 or tr.ask_marker > 0)
     on_cooldown = sum(
         1 for sym in MONITORED_SYMBOLS
-        if now - max(last_surge_alert.get(sym, 0), last_crash_alert.get(sym, 0)) < COOLDOWN_SECONDS
+        if now - last_alert.get(sym, 0) < COOLDOWN_SECONDS
     )
 
-    # Show top movers based on how far current price is from tracked floor/ceiling
     movers = []
     for symbol, tr in trackers.items():
-        if tr.floor_price > 0 and tr.floor_time > 0:
-            elapsed = now - tr.floor_time
-            if elapsed < SPLASH_WINDOW:
-                movers.append((symbol, elapsed, tr.floor_price))
-
-    movers.sort(key=lambda x: x[1])
+        if tr.events:
+            movers.append((symbol, len(tr.events), now - tr.events[0]))
+    movers.sort(key=lambda x: (-x[1], x[2]))
     top_text = ""
-    for sym, elapsed, price in movers[:5]:
+    for sym, n, span in movers[:5]:
         tag = " 🔴" if sym in banned_symbols else (
             " 🟡" if sym in frozen_symbols and frozen_symbols[sym] > now else ""
         )
-        top_text += f"  📌 <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b>{tag}: floor ${price:.4f} ({int(elapsed)}s ago)\n"
-
+        top_text += f"  📌 <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b>{tag}: {n} fluxes / {int(span)}s\n"
     if not top_text:
-        top_text = "  ⏳ Filling window, wait 10s...\n"
+        top_text = "  ⏳ No fluctuations in window yet.\n"
 
     mute_status = f"\n🔇 Muted: <b>{mute_remaining()}</b>" if is_muted() else ""
+    ws_tag = "🟢" if ws_state["connected"] else "🔴"
+
     admin_extra = (
-        f"\n👥 Subscribers: <b>{len(subscribers)}</b>\n"
-        f"🔴 Banned: <b>{len(banned_symbols)}</b>\n"
-        f"🟡 Frozen: <b>{len(frozen_symbols)}</b>"
+        f"\n👥 Subscribers: <b>{len(subscribers)}</b>"
+        f"\n🔴 Banned: <b>{len(banned_symbols)}</b>"
+        f"\n🟡 Frozen: <b>{len(frozen_symbols)}</b>"
         f"{mute_status}"
         if is_admin(message) else ""
     )
 
-    await reply(message, 
+    await reply(message,
         f"📊 <b>Monitor Status</b>\n\n"
+        f"{ws_tag} WS: <b>{'connected' if ws_state['connected'] else 'down'}</b> "
+        f"(subs <b>{ws_state['subscribed']}</b>, msgs <b>{ws_state['msg_count']}</b>)\n"
         f"🔍 Symbols watched: <b>{len(MONITORED_SYMBOLS)}</b>\n"
-        f"📈 Windows with data: <b>{windows_with_data}/{len(MONITORED_SYMBOLS)}</b>\n"
+        f"📈 With data: <b>{with_data}/{len(MONITORED_SYMBOLS)}</b>\n"
         f"🔕 On cooldown: <b>{on_cooldown}</b>\n"
-        f"⚡ Threshold: <b>±{surge_threshold}%</b>\n"
-        f"⏱ Window: <b>{WINDOW_SECONDS}s</b>\n"
-        f"🔄 Fetch interval: <b>{FETCH_INTERVAL}s</b>"
+        f"⚡ Threshold: <b>{flux_pct}%</b>  Count: <b>{flux_count}</b>  Window: <b>{flux_window}s</b>\n"
+        f"📚 Depth filter: top-3 ≥<b>{depth_min_vol:.0f}</b> vol, spread ≤<b>{depth_range_pct}%</b>"
         f"{admin_extra}\n\n"
-        f"🏆 <b>Top movers right now:</b>\n{top_text}"
+        f"🏆 <b>Most fluctuating now:</b>\n{top_text}"
+    )
+
+
+@router.message(Command("wsstatus"))
+async def cmd_wsstatus(message: Message) -> None:
+    """Verify the WebSocket feed is alive and pushing data."""
+    now      = time.time()
+    age      = now - ws_state["last_msg_ts"] if ws_state["last_msg_ts"] else -1
+    rate_10s = len(ws_state["msgs_last_10s"])
+    uptime   = (now - ws_state["connect_time"]) if ws_state["connect_time"] else 0
+    h, m, s  = int(uptime // 3600), int((uptime % 3600) // 60), int(uptime % 60)
+    uptime_s = f"{h}h{m:02d}m{s:02d}s" if h else f"{m}m{s:02d}s"
+
+    sample_lines = []
+    for sym in ("AAPLSTOCK_USDT", "MSFTSTOCK_USDT", "NAS100_USDT"):
+        b = depth_books.get(sym)
+        if b and b.bids and b.asks:
+            age_s = now - b.ts
+            sample_lines.append(
+                f"  • <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b>: "
+                f"bid <code>{b.bids[0][0]}</code> × <code>{b.bids[0][1]}</code>, "
+                f"ask <code>{b.asks[0][0]}</code> × <code>{b.asks[0][1]}</code> "
+                f"({age_s:.1f}s ago)"
+            )
+    sample_text = "\n".join(sample_lines) if sample_lines else "  (no books yet)"
+
+    err_text = ""
+    if ws_state["errors"] and is_admin(message):
+        err_text = "\n\n<b>Recent errors:</b>\n" + "\n".join(
+            f"  ⚠️ <code>{e}</code>" for e in list(ws_state["errors"])[-5:]
+        )
+
+    age_str = f"{age:.1f}s" if age >= 0 else "n/a"
+    await reply(message,
+        f"📡 <b>WebSocket health</b>\n\n"
+        f"State: <b>{'🟢 connected' if ws_state['connected'] else '🔴 down'}</b>\n"
+        f"Uptime: <b>{uptime_s}</b>  Reconnects: <b>{ws_state['reconnects']}</b>\n"
+        f"Subscribed: <b>{ws_state['subscribed']}/{len(MONITORED_SYMBOLS)}</b>\n"
+        f"Messages: <b>{ws_state['msg_count']}</b> total  <b>{rate_10s}</b> in last 10s\n"
+        f"Last msg: <b>{age_str}</b> ago\n\n"
+        f"<b>Sample books:</b>\n{sample_text}"
+        f"{err_text}"
     )
 
 
@@ -667,11 +1078,11 @@ async def cmd_symbols(message: Message) -> None:
         else:
             tag = "🟢"
         lines.append(f"  {tag} <b>{display}</b> — <code>{sym}</code>")
-    await reply(message, 
-        f"📋 <b>Monitored symbols ({len(MONITORED_SYMBOLS)}):</b>\n"
-        + "\n".join(lines)
-        + "\n\n🟢 Active  🟡 Frozen  🔴 Banned"
-    )
+    chunks = ["\n".join(lines[i:i+50]) for i in range(0, len(lines), 50)]
+    for i, chunk in enumerate(chunks):
+        prefix = f"📋 <b>Monitored ({len(MONITORED_SYMBOLS)}):</b>\n" if i == 0 else ""
+        suffix = "\n\n🟢 Active  🟡 Frozen  🔴 Banned" if i == len(chunks) - 1 else ""
+        await reply(message, prefix + chunk + suffix)
 
 
 @router.message(Command("ban"))
@@ -697,7 +1108,7 @@ async def cmd_unban(message: Message) -> None:
         return
     sym = find_symbol(args[0])
     if not sym or sym not in banned_symbols:
-        await reply(message, f"❌ Not found or not banned.")
+        await reply(message, "❌ Not found or not banned.")
         return
     banned_symbols.discard(sym)
     await reply(message, f"✅ <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b> is ACTIVE again.")
@@ -789,7 +1200,7 @@ async def cmd_kick(message: Message) -> None:
         await reply(message, "❌ Invalid ID.")
         return
     if target_id not in subscribers:
-        await reply(message, f"ℹ️ Not subscribed.")
+        await reply(message, "ℹ️ Not subscribed.")
         return
     name = subscribers[target_id]["name"]
     subscribers.pop(target_id)
@@ -829,17 +1240,19 @@ async def cmd_broadcast(message: Message) -> None:
 async def cmd_debugconfig(message: Message) -> None:
     await reply(message,
         f"⚙️ <b>Current Config</b>\n\n"
-        f"CHANNEL_ID: <code>{CHANNEL_ID or 'NOT SET'}</code>\n"
-        f"THREAD_ID:  <code>{THREAD_ID or 'NOT SET'}</code>\n"
-        f"THRESHOLD:  <code>±{surge_threshold}%</code>\n"
-        f"WINDOW:     <code>{WINDOW_SECONDS}s</code>\n"
-        f"COOLDOWN:   <code>{COOLDOWN_SECONDS}s</code>"
+        f"SUBSCRIBERS: <code>{len(subscribers)}</code>\n"
+        f"FLUX_PCT:    <code>{flux_pct}</code>\n"
+        f"FLUX_COUNT:  <code>{flux_count}</code>\n"
+        f"FLUX_WINDOW: <code>{flux_window}s</code>\n"
+        f"DEPTH_RANGE: <code>{depth_range_pct}%</code>\n"
+        f"DEPTH_VOL:   <code>{depth_min_vol:.0f}</code>\n"
+        f"COOLDOWN:    <code>{COOLDOWN_SECONDS}s</code>"
     )
 
 
 @router.message(Command("debug"))
 async def cmd_debug(message: Message) -> None:
-    await reply(message, "🔍 Hitting API, please wait...")
+    await reply(message, "🔍 Hitting REST API, please wait...")
     connector = aiohttp.TCPConnector()
     async with aiohttp.ClientSession(connector=connector) as session:
         try:
@@ -856,22 +1269,18 @@ async def cmd_debug(message: Message) -> None:
                     await reply(message, "⚠️ Connected but data empty!")
                     return
                 found, not_found = discover_symbols(data)
-                # Also check bid1/ask1 availability on a sample ticker
-                sample = next((t for t in data if t.get("symbol") in found), None)
-                book_info = ""
-                if sample:
-                    bid1 = sample.get("bid1") or sample.get("bidPrice")
-                    ask1 = sample.get("ask1") or sample.get("askPrice")
-                    book_info = f"\n\n📖 Sample bid1/ask1: <b>{bid1} / {ask1}</b>"
-                matched_text = "\n".join(
+                matched_lines = [
                     f"  ✅ <b>{base}</b> → <code>{sym}</code>"
                     for sym, base in sorted(found.items(), key=lambda x: x[1])
-                )
-                await reply(message, 
+                ]
+                # First chunk
+                await reply(message,
                     f"✅ <b>API OK</b> — {len(data)} tickers\n"
-                    f"Matched: <b>{len(found)}/{len(HARDCODED_SYMBOLS)}</b>{book_info}\n\n"
-                    f"{matched_text}"
+                    f"Matched: <b>{len(found)}/{len(HARDCODED_SYMBOLS)}</b>\n\n"
+                    + "\n".join(matched_lines[:50])
                 )
+                if len(matched_lines) > 50:
+                    await reply(message, "\n".join(matched_lines[50:]))
                 if not_found:
                     await reply(message, f"❌ Not in API: <code>{', '.join(sorted(not_found))}</code>")
         except asyncio.TimeoutError:
@@ -886,345 +1295,18 @@ async def cmd_test(message: Message, bot: Bot) -> None:
     if not symbols_discovered:
         await reply(message, "⏳ Still discovering symbols, try again shortly.")
         return
-    await reply(message,
-        "🧪 <b>Test mode activated!</b>\n"
-        "Scanning for first symbol with ≥ <b>0.1%</b> move via bid1/ask1.\n"
-        f"One alert fires then returns to <b>±{surge_threshold}%</b>."
-    )
-    best_symbol  = None
-    best_pct     = 0.0
-    best_price   = 0.0
-    best_ptype   = "bid1"
-    best_elapsed = 0
-    now          = time.time()
-
-    for symbol, tr in trackers.items():
-        if symbol in banned_symbols:
-            continue
-        if symbol in frozen_symbols and frozen_symbols[symbol] > now:
-            continue
-
-        # Check UP: rise from floor
-        if tr.floor_price > 0 and tr.floor_time > 0:
-            # we don't have a current ask1 here — skip; test mode fires in the loop
-            pass
-
-    # No snapshot data available at command time — fall back to background test mode
     test_mode    = True
     test_chat_id = message.chat.id
-    await reply(message, "⏳ Watching for next 0.1%+ move — alert will fire to the group thread.")
+    await reply(message,
+        "🧪 <b>Test mode armed.</b>\n"
+        f"Will fire on the FIRST ≥{flux_pct}% fluctuation that also passes the depth filter.\n"
+        "Returns to normal afterwards."
+    )
 
 
-
-
-# Catch-all: silently ignore any non-command messages (prevents "not handled" log spam)
 @router.message()
 async def cmd_catch_all(message: Message) -> None:
     pass
-
-
-# ---------------------------------------------------------------------------
-# MEXC API
-# ---------------------------------------------------------------------------
-
-
-async def fetch_raw_tickers(session: aiohttp.ClientSession) -> Optional[list[dict]]:
-    try:
-        async with session.get(
-            MEXC_TICKER_URL, headers=HEADERS,
-            timeout=aiohttp.ClientTimeout(total=30), ssl=True,
-        ) as response:
-            if response.status != 200:
-                logger.warning("HTTP %d from API", response.status)
-                return None
-            payload: dict = await response.json(content_type=None)
-            if not payload.get("success"):
-                logger.warning("API returned success=false")
-                return None
-            return payload.get("data") or None
-    except asyncio.TimeoutError:
-        logger.warning("Ticker request timed out")
-    except aiohttp.ClientConnectionError as exc:
-        logger.warning("Connection error: %s", exc)
-    except Exception as exc:
-        logger.error("Unexpected error: %s", exc, exc_info=True)
-    return None
-
-
-# ── CHANGED: parse bid1 + ask1 instead of lastPrice ──
-def parse_book(ticker: dict) -> Optional[tuple[float, float]]:
-    """Extract (bid1, ask1). Returns None if either is missing."""
-    try:
-        bid1 = float(ticker.get("bid1") or ticker.get("bidPrice") or 0)
-        ask1 = float(ticker.get("ask1") or ticker.get("askPrice") or 0)
-        if bid1 > 0 and ask1 > 0:
-            return bid1, ask1
-    except (TypeError, ValueError):
-        pass
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Sliding window — CHANGED to store BookSnapshot
-# ---------------------------------------------------------------------------
-
-
-SPLASH_WINDOW_DAY:   int = 15   # seconds — market hours (08:00–21:00 UTC)
-SPLASH_WINDOW_NIGHT: int = 60   # seconds — night hours  (21:00–08:00 UTC)
-
-
-def get_splash_window() -> int:
-    """Returns 15s during market hours, 60s at night (23:00–08:00 UTC)."""
-    import datetime
-    h = datetime.datetime.utcnow().hour
-    return SPLASH_WINDOW_DAY if 8 <= h < 23 else SPLASH_WINDOW_NIGHT
-
-
-# Keep for reference
-SPLASH_WINDOW: int = SPLASH_WINDOW_DAY
-
-
-def update_and_check(
-    symbol: str,
-    now: float,
-    bid1: float,
-    ask1: float,
-    threshold: float,
-) -> Optional[tuple[float, float, str, int]]:
-    """
-    Core splash detection logic.
-
-    Tracks the LOWEST ask1 (floor) for UP splashes and
-    the HIGHEST bid1 (ceiling) for DOWN crashes.
-
-    Returns (pct_change, price, price_type, elapsed_seconds) or None.
-
-    Rules:
-      - If ask1 sets a new low → update floor + reset timer
-      - If ask1 >= floor * (1 + threshold/100) → UP alert, reset
-      - If 60s pass since floor was set and threshold not reached → reset
-      (same logic mirrored for DOWN via bid1)
-    """
-    tr = trackers[symbol]
-
-    result = None
-
-    # ── UP: track lowest ask1 ─────────────────────────────────────────────
-    if ask1 > 0:
-        if tr.floor_price == 0.0:
-            # First reading — initialise floor
-            tr.floor_price = ask1
-            tr.floor_time  = now
-        elif ask1 < tr.floor_price:
-            # New low → update floor, restart timer
-            tr.floor_price = ask1
-            tr.floor_time  = now
-        else:
-            elapsed = now - tr.floor_time
-            rise_pct = (ask1 - tr.floor_price) / tr.floor_price * 100
-
-            if rise_pct >= threshold:
-                # 🚀 SPLASH triggered
-                result = (rise_pct, ask1, "ask1", int(elapsed))
-                # Reset for next cycle
-                tr.floor_price = ask1
-                tr.floor_time  = now
-            elif elapsed > get_splash_window():
-                # Timeout — no splash within window, reset
-                tr.floor_price = ask1
-                tr.floor_time  = now
-
-    # ── DOWN: track highest bid1 ──────────────────────────────────────────
-    if bid1 > 0 and result is None:
-        if tr.ceil_price == 0.0:
-            tr.ceil_price = bid1
-            tr.ceil_time  = now
-        elif bid1 > tr.ceil_price:
-            tr.ceil_price = bid1
-            tr.ceil_time  = now
-        else:
-            elapsed  = now - tr.ceil_time
-            fall_pct = (tr.ceil_price - bid1) / tr.ceil_price * 100
-
-            if fall_pct >= threshold:
-                result = (-fall_pct, bid1, "bid1", int(elapsed))
-                tr.ceil_price = bid1
-                tr.ceil_time  = now
-            elif elapsed > get_splash_window():
-                    tr.ceil_price = bid1
-                    tr.ceil_time  = now
-
-    return result
-
-
-# Keep for test mode compatibility
-def check_movement(symbol: str, threshold: float) -> Optional[tuple[float, float, str]]:
-    tr = trackers.get(symbol)
-    if not tr or tr.floor_price == 0.0:
-        return None
-    ask1 = tr.floor_price  # use last known floor as proxy
-    return None  # test mode will use update_and_check directly
-
-
-# ---------------------------------------------------------------------------
-# Monitoring loop
-# ---------------------------------------------------------------------------
-
-
-async def auto_mute_scheduler(bot: Bot) -> None:
-    global muted_until
-    # Track each window independently so one firing doesn't block another
-    last_muted:   dict[str, object] = {}   # window_key → date
-    last_unmuted: dict[str, object] = {}   # window_key → date
-
-    logger.info("Auto-mute scheduler started")
-
-    while True:
-        await asyncio.sleep(20)
-        try:
-            import datetime
-            now_utc = datetime.datetime.utcnow()
-            weekday = now_utc.weekday()
-            today   = now_utc.date()
-            h, m    = now_utc.hour, now_utc.minute
-
-            if weekday >= 5:
-                continue
-
-            windows = {
-                "00:00": {
-                    "active":    h == 0 and m < 5,
-                    "duration":  5 * 60,
-                    "mute_msg":  "🔇 <b>Auto-muted</b> — 00:00 UTC pause (5 min).",
-                    "unmute_h":  0, "unmute_m": 5,
-                    "unmute_msg": "🔊 <b>Auto-unmuted</b> — 00:05 UTC.",
-                },
-                "13:29": {
-                    "active":    (h == 13 and m >= 29) or (h == 14 and m < 30),
-                    "duration":  61 * 60,
-                    "mute_msg":  "🔇 <b>Auto-muted</b> — market open window (13:29–14:30 UTC).",
-                    "unmute_h":  14, "unmute_m": 30,
-                    "unmute_msg": "🔊 <b>Auto-unmuted</b> — market open window passed.",
-                },
-            }
-
-            for key, w in windows.items():
-                if w["active"] and last_muted.get(key) != today:
-                    muted_until         = time.time() + w["duration"]
-                    last_muted[key]     = today
-                    logger.info("Auto-mute: %s window", key)
-                    try:
-                        await bot.send_message(chat_id=CHANNEL_ID, text=w["mute_msg"],
-                                               message_thread_id=THREAD_ID)
-                    except Exception:
-                        pass
-
-                elif (not w["active"]
-                      and last_muted.get(key) == today
-                      and last_unmuted.get(key) != today
-                      and h >= w["unmute_h"] and m >= w["unmute_m"]):
-                    muted_until          = 0.0
-                    last_unmuted[key]    = today
-                    logger.info("Auto-unmute: %s window passed", key)
-                    try:
-                        await bot.send_message(chat_id=CHANNEL_ID, text=w["unmute_msg"],
-                                               message_thread_id=THREAD_ID)
-                    except Exception:
-                        pass
-
-        except Exception as exc:
-            logger.error("Auto-mute scheduler error: %s", exc)
-
-
-async def monitoring_loop(bot: Bot) -> None:
-    global test_mode, test_chat_id, MONITORED_SYMBOLS, symbols_discovered
-
-    connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        logger.info(
-            "Monitoring started — interval=%.1fs window=%ds cooldown=%ds",
-            FETCH_INTERVAL, WINDOW_SECONDS, COOLDOWN_SECONDS,
-        )
-
-        while True:
-            cycle_start = time.monotonic()
-            raw_data = await fetch_raw_tickers(session)
-
-            if raw_data:
-                now = time.time()
-
-                if not symbols_discovered:
-                    found, not_found = discover_symbols(raw_data)
-                    MONITORED_SYMBOLS = set(found.keys())
-                    for sym in MONITORED_SYMBOLS:
-                        trackers[sym] = SplashTracker()
-                    symbols_discovered = True
-                    logger.info("Ready: %d symbols (%d missing)", len(MONITORED_SYMBOLS), len(not_found))
-
-                # Clean expired freezes
-                for s in [s for s, t in list(frozen_symbols.items()) if t <= now]:
-                    frozen_symbols.pop(s)
-
-                ticker_map = {t.get("symbol", ""): t for t in raw_data}
-
-                for sym in MONITORED_SYMBOLS:
-                    if sym in banned_symbols or sym in frozen_symbols:
-                        continue
-
-                    ticker = ticker_map.get(sym)
-                    if not ticker:
-                        continue
-
-                    book = parse_book(ticker)
-                    if book is None:
-                        continue
-                    bid1, ask1 = book
-
-                    # Initialise tracker on first sight
-                    if sym not in trackers:
-                        trackers[sym] = SplashTracker()
-
-                    # Test mode — use low 0.1% threshold
-                    if test_mode:
-                        result = update_and_check(sym, now, bid1, ask1, 0.1)
-                        if result:
-                            pct, price, ptype, elapsed = result
-                            test_mode = False
-                            target = None if CHANNEL_ID else test_chat_id
-                            asyncio.create_task(
-                                send_surge_alert(bot, sym, pct, price, ptype,
-                                                 elapsed_seconds=elapsed,
-                                                 chat_id=target, is_test=True)
-                            )
-                        continue
-
-                    if is_muted():
-                        # Still update tracker so floor/ceiling stay fresh
-                        update_and_check(sym, now, bid1, ask1, 9999)
-                        continue
-
-                    result = update_and_check(sym, now, bid1, ask1, surge_threshold)
-                    if result:
-                        pct, price, ptype, elapsed = result
-                        if pct > 0:
-                            last_sent = last_surge_alert.get(sym, 0.0)
-                            if now - last_sent >= COOLDOWN_SECONDS:
-                                last_surge_alert[sym] = now
-                                asyncio.create_task(
-                                    send_surge_alert(bot, sym, pct, price, ptype,
-                                                     elapsed_seconds=elapsed)
-                                )
-                        else:
-                            last_sent = last_crash_alert.get(sym, 0.0)
-                            if now - last_sent >= COOLDOWN_SECONDS:
-                                last_crash_alert[sym] = now
-                                asyncio.create_task(
-                                    send_surge_alert(bot, sym, pct, price, ptype,
-                                                     elapsed_seconds=elapsed)
-                                )
-
-            elapsed = time.monotonic() - cycle_start
-            await asyncio.sleep(max(0.0, FETCH_INTERVAL - elapsed))
 
 
 # ---------------------------------------------------------------------------
@@ -1242,43 +1324,35 @@ async def main() -> None:
 
     me = await bot.get_me()
     logger.info(
-        "Bot @%s started — threshold=±%.1f%% channel=%s thread=%s subscribers=%d",
-        me.username, surge_threshold,
-        CHANNEL_ID or "NOT SET",
-        THREAD_ID or "NOT SET",
-        len(subscribers),
+        "Bot @%s started — flux=%.2f%% count=%d window=%ds depth_vol=%.0f depth_range=%.2f%% subscribers=%d",
+        me.username, flux_pct, flux_count, flux_window, depth_min_vol, depth_range_pct, len(subscribers),
     )
 
-    # Init Yahoo crumb in background (non-blocking)
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, _refresh_yahoo_crumb)
+    # Discover symbols via REST once, then start WS
+    boot_session = aiohttp.ClientSession()
+    try:
+        await bootstrap_symbols(boot_session)
+    finally:
+        await boot_session.close()
 
-    # Verify we can actually reach the thread at startup
-    if CHANNEL_ID:
-        try:
-            await bot.send_message(
-                chat_id=CHANNEL_ID,
-                text="🟢 <b>Splash bot started</b> — monitoring active.",
-                message_thread_id=THREAD_ID,
-            )
-            logger.info("Startup ping to thread OK")
-        except Exception as exc:
-            logger.error("STARTUP PING FAILED — check CHAT_ID/THREAD_ID: %s", exc)
+    if subscribers:
+        await _notify_subscribers(
+            bot,
+            f"🟢 <b>Flux bot started</b> — {len(MONITORED_SYMBOLS)} symbols, "
+            f"{flux_count}× ≥{flux_pct}% / {flux_window}s, "
+            f"depth ≥{depth_min_vol:.0f}/{depth_range_pct}%."
+        )
 
-    monitor_task   = asyncio.create_task(monitoring_loop(bot))
-    automute_task  = asyncio.create_task(auto_mute_scheduler(bot))
+    ws_task       = asyncio.create_task(ws_loop(bot))
+    automute_task = asyncio.create_task(auto_mute_scheduler(bot))
 
     try:
-        await dp.start_polling(
-            bot,
-            allowed_updates=["message"],
-        )
+        await dp.start_polling(bot, allowed_updates=["message"])
     finally:
-        monitor_task.cancel()
-        automute_task.cancel()
-        for task in (monitor_task, automute_task):
+        for t in (ws_task, automute_task):
+            t.cancel()
             try:
-                await task
+                await t
             except asyncio.CancelledError:
                 pass
         await bot.session.close()
