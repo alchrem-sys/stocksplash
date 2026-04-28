@@ -552,13 +552,18 @@ def build_flux_message(
     span: float,
     bid1: float,
     ask1: float,
+    bid1_usd: float = 0.0,
+    ask1_usd: float = 0.0,
     is_test: bool = False,
 ) -> str:
     display = HARDCODED_SYMBOLS.get(symbol, symbol.replace("_", ""))
     header  = "🧪 <b>[TEST]</b> " if is_test else "🚨 "
+    bid_usd_str = f"  (${bid1_usd:,.0f})" if bid1_usd > 0 else ""
+    ask_usd_str = f"  (${ask1_usd:,.0f})" if ask1_usd > 0 else ""
     return (
         f"{header}<b>${display}</b>  {count} fluxes / {int(span)}s  (≥{flux_pct}%)\n"
-        f"MEXC bid <b>${bid1:.4f}</b>  ask <b>${ask1:.4f}</b>"
+        f"bid <b>${bid1:.4f}</b>{bid_usd_str}\n"
+        f"ask <b>${ask1:.4f}</b>{ask_usd_str}"
     )
 
 
@@ -602,10 +607,12 @@ async def send_flux_alert(
     span: float,
     bid1: float,
     ask1: float,
+    bid1_usd: float = 0.0,
+    ask1_usd: float = 0.0,
     is_test: bool = False,
     chat_id: Optional[int] = None,
 ) -> None:
-    text     = build_flux_message(symbol, count, span, bid1, ask1, is_test)
+    text     = build_flux_message(symbol, count, span, bid1, ask1, bid1_usd, ask1_usd, is_test)
     keyboard = build_trade_keyboard(symbol)
     if chat_id:
         try:
@@ -679,8 +686,18 @@ async def process_depth_update(bot: Bot, symbol: str, data: dict) -> None:
 
     tr.events.clear()
 
+    # Compute bid1/ask1 USD notional for the alert message
+    try:
+        bid1_size = float(book.bids[0][1])
+        ask1_size = float(book.asks[0][1])
+    except (IndexError, ValueError, TypeError):
+        bid1_size = ask1_size = 0.0
+    bid1_usd = _level_usd(symbol, bid1, bid1_size)
+    ask1_usd = _level_usd(symbol, ask1, ask1_size)
+
     asyncio.create_task(
         send_flux_alert(bot, symbol, count, span, bid1, ask1,
+                        bid1_usd=bid1_usd, ask1_usd=ask1_usd,
                         is_test=is_test, chat_id=target_chat)
     )
 
