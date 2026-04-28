@@ -984,6 +984,7 @@ async def cmd_help(message: Message) -> None:
         "<b>📊 Info:</b>\n"
         "/start — subscribe to DM alerts\n"
         "/stop — unsubscribe\n"
+        "/settings — show every applied parameter\n"
         "/status — live stats\n"
         "/symbols — all monitored symbols\n"
         "/book TICKER — show top-5 bid/ask\n"
@@ -1430,16 +1431,58 @@ async def cmd_broadcast(message: Message) -> None:
     await reply(message, f"✅ Sent: <b>{sent}</b>, Removed dead: <b>{len(dead)}</b>")
 
 
-@router.message(Command("debugconfig"))
-async def cmd_debugconfig(message: Message) -> None:
+@router.message(Command("settings"))
+async def cmd_settings(message: Message) -> None:
+    """Show every applied parameter — what the bot is currently using."""
+    now = time.time()
+
+    range_str = f"{depth_range_pct}%"     + ("  (off)" if depth_range_pct <= 0 else "")
+    vol_str   = f"${depth_min_vol:,.0f}"  + ("  (off)" if depth_min_vol   <= 0 else "")
+
+    if is_muted():
+        mute_str = f"🔇 muted, {mute_remaining()} left"
+    else:
+        mute_str = "🔊 active"
+
+    # Frozen: drop expired
+    live_frozen = {s: t for s, t in frozen_symbols.items() if t > now}
+    if live_frozen:
+        frozen_lines = "\n".join(
+            f"     • <b>{HARDCODED_SYMBOLS.get(s, s)}</b> — "
+            f"{int((t-now)//60)}m {int((t-now)%60)}s"
+            for s, t in sorted(live_frozen.items(), key=lambda kv: kv[1])
+        )
+        frozen_block = f"\n{frozen_lines}"
+    else:
+        frozen_block = " (none)"
+
+    if banned_symbols:
+        banned_block = " " + ", ".join(
+            f"<b>{HARDCODED_SYMBOLS.get(s, s)}</b>" for s in sorted(banned_symbols)
+        )
+    else:
+        banned_block = " (none)"
+
+    storage = "Upstash ✅" if _upstash_enabled() else f"file (<code>{SUBSCRIBERS_FILE}</code>)"
+    ws_tag  = "🟢 connected" if ws_state["connected"] else "🔴 down"
+
     await reply(message,
-        f"⚙️ <b>Current Config</b>\n\n"
-        f"SUBSCRIBERS: <code>{len(subscribers)}</code>\n"
-        f"FLUX_PCT:    <code>{flux_pct}</code>\n"
-        f"FLUX_COUNT:  <code>{flux_count}</code>\n"
-        f"FLUX_WINDOW: <code>{flux_window}s</code>\n"
-        f"DEPTH_RANGE: <code>{depth_range_pct}%</code>\n"
-        f"DEPTH_VOL:   <code>${depth_min_vol:.0f}</code>"
+        f"⚙️ <b>Applied settings</b>\n\n"
+        f"<b>Fluctuation rule</b>\n"
+        f"  • threshold: <b>{flux_pct}%</b>  (per bid1/ask1 move)\n"
+        f"  • count:     <b>{flux_count}</b>  (within window)\n"
+        f"  • window:    <b>{flux_window}s</b>\n\n"
+        f"<b>Depth filter</b>\n"
+        f"  • top-3 spread cap: <b>{range_str}</b>\n"
+        f"  • min USD / level:  <b>{vol_str}</b>\n\n"
+        f"<b>State</b>\n"
+        f"  • alerts:      {mute_str}\n"
+        f"  • symbols:     <b>{len(MONITORED_SYMBOLS)}</b> watched\n"
+        f"  • subscribers: <b>{len(subscribers)}</b>\n"
+        f"  • websocket:   {ws_tag}\n"
+        f"  • storage:     {storage}\n\n"
+        f"<b>Banned:</b>{banned_block}\n"
+        f"<b>Frozen:</b>{frozen_block}"
     )
 
 
