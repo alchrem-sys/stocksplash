@@ -180,9 +180,10 @@ import urllib.error
 
 SUBSCRIBERS_FILE = Path(os.getenv("SUBSCRIBERS_FILE") or (Path(__file__).parent / "subscribers.json"))
 
-UPSTASH_URL   = (os.getenv("UPSTASH_REDIS_REST_URL")   or "").rstrip("/")
-UPSTASH_TOKEN = (os.getenv("UPSTASH_REDIS_REST_TOKEN") or "")
-UPSTASH_KEY   = os.getenv("UPSTASH_SUBS_KEY", "stocksplash:subscribers")
+UPSTASH_URL       = (os.getenv("UPSTASH_REDIS_REST_URL")   or "").rstrip("/")
+UPSTASH_TOKEN     = (os.getenv("UPSTASH_REDIS_REST_TOKEN") or "")
+UPSTASH_KEY       = os.getenv("UPSTASH_SUBS_KEY",     "stocksplash:subscribers")
+UPSTASH_SETTINGS_KEY = os.getenv("UPSTASH_SETTINGS_KEY", "stocksplash:settings")
 
 
 def _upstash_enabled() -> bool:
@@ -210,15 +211,26 @@ def _upstash_command(command: list[str]) -> Optional[dict]:
     return None
 
 
-def _upstash_load() -> Optional[dict[int, dict]]:
-    resp = _upstash_command(["GET", UPSTASH_KEY])
+def _upstash_get(key: str) -> Optional[str]:
+    resp = _upstash_command(["GET", key])
     if resp is None:
         return None
-    val = resp.get("result")
-    if not val:
+    return resp.get("result")  # str or None
+
+
+def _upstash_set(key: str, value: str) -> bool:
+    resp = _upstash_command(["SET", key, value])
+    return bool(resp and resp.get("result") == "OK")
+
+
+def _upstash_load() -> Optional[dict[int, dict]]:
+    raw = _upstash_get(UPSTASH_KEY)
+    if raw is None and not _upstash_enabled():
+        return None
+    if not raw:
         return {}
     try:
-        data = json.loads(val)
+        data = json.loads(raw)
         return {int(k): v for k, v in data.items()}
     except Exception as exc:
         logger.error("Upstash subscribers parse error: %s", exc)
@@ -226,9 +238,7 @@ def _upstash_load() -> Optional[dict[int, dict]]:
 
 
 def _upstash_save() -> bool:
-    payload = json.dumps(subscribers)
-    resp = _upstash_command(["SET", UPSTASH_KEY, payload])
-    return bool(resp and resp.get("result") == "OK")
+    return _upstash_set(UPSTASH_KEY, json.dumps(subscribers))
 
 
 def load_subscribers() -> dict[int, dict]:
@@ -261,6 +271,61 @@ def save_subscribers() -> None:
 
 
 subscribers: dict[int, dict] = load_subscribers()
+
+
+# ---------------------------------------------------------------------------
+# Runtime settings persistence (Upstash) — survives bot restart
+# ---------------------------------------------------------------------------
+
+
+def save_settings() -> None:
+    """Persist all runtime-tunable settings + admin state to Upstash.
+    Silent no-op when Upstash isn't configured."""
+    if not _upstash_enabled():
+        return
+    payload = {
+        "flux_pct":        flux_pct,
+        "flux_count":      flux_count,
+        "flux_window":     flux_window,
+        "depth_range_pct": depth_range_pct,
+        "depth_min_vol":   depth_min_vol,
+        "muted_until":     muted_until,
+        "banned":          sorted(banned_symbols),
+        "frozen":          frozen_symbols,
+    }
+    if not _upstash_set(UPSTASH_SETTINGS_KEY, json.dumps(payload)):
+        logger.warning("Upstash settings save failed")
+
+
+def load_settings() -> None:
+    """Pull persisted settings from Upstash and apply them on top of env defaults."""
+    global flux_pct, flux_count, flux_window, depth_range_pct, depth_min_vol, muted_until
+    if not _upstash_enabled():
+        return
+    raw = _upstash_get(UPSTASH_SETTINGS_KEY)
+    if not raw:
+        return
+    try:
+        d = json.loads(raw)
+    except Exception as exc:
+        logger.error("Upstash settings parse error: %s", exc)
+        return
+
+    if "flux_pct"        in d: flux_pct        = float(d["flux_pct"])
+    if "flux_count"      in d: flux_count      = int(d["flux_count"])
+    if "flux_window"     in d: flux_window     = int(d["flux_window"])
+    if "depth_range_pct" in d: depth_range_pct = float(d["depth_range_pct"])
+    if "depth_min_vol"   in d: depth_min_vol   = float(d["depth_min_vol"])
+    if "muted_until"     in d: muted_until     = float(d["muted_until"])
+    if "banned"          in d: banned_symbols.update(d["banned"])
+    if "frozen"          in d:
+        frozen_symbols.update({k: float(v) for k, v in d["frozen"].items()})
+    logger.info(
+        "Loaded settings from Upstash: flux=%.2f%% count=%d window=%ds range=%.2f%% vol=$%.0f banned=%d frozen=%d muted_until=%s",
+        flux_pct, flux_count, flux_window, depth_range_pct, depth_min_vol,
+        len(banned_symbols), len(frozen_symbols),
+        f"{int(muted_until)}" if muted_until else "0",
+    )
 
 # ---------------------------------------------------------------------------
 # State
@@ -820,6 +885,7 @@ async def auto_mute_scheduler(bot: Bot) -> None:
                 if w["active"] and last_muted.get(key) != today:
                     muted_until         = time.time() + w["duration"]
                     last_muted[key]     = today
+                    save_settings()
                     logger.info("Auto-mute: %s window", key)
                     await _notify_subscribers(bot, w["mute_msg"])
                 elif (not w["active"]
@@ -828,6 +894,7 @@ async def auto_mute_scheduler(bot: Bot) -> None:
                       and h >= w["unmute_h"] and m >= w["unmute_m"]):
                     muted_until          = 0.0
                     last_unmuted[key]    = today
+                    save_settings()
                     logger.info("Auto-unmute: %s window passed", key)
                     await _notify_subscribers(bot, w["unmute_msg"])
         except Exception as exc:
@@ -948,6 +1015,7 @@ async def cmd_threshold(message: Message) -> None:
         return
     old = flux_pct
     flux_pct = new_val
+    save_settings()
     await reply(message, f"✅ Fluctuation %: <b>{old}</b> → <b>{new_val}</b>")
 
 
@@ -967,6 +1035,7 @@ async def cmd_count(message: Message) -> None:
         return
     old = flux_count
     flux_count = new_val
+    save_settings()
     await reply(message, f"✅ Count: <b>{old}</b> → <b>{new_val}</b>")
 
 
@@ -986,6 +1055,7 @@ async def cmd_window(message: Message) -> None:
         return
     old = flux_window
     flux_window = new_val
+    save_settings()
     await reply(message, f"✅ Window: <b>{old}s</b> → <b>{new_val}s</b>")
 
 
@@ -1006,6 +1076,7 @@ async def cmd_depthrange(message: Message) -> None:
         return
     old = depth_range_pct
     depth_range_pct = new_val
+    save_settings()
     suffix = " (off)" if new_val == 0 else ""
     await reply(message, f"✅ Depth range: <b>{old}%</b> → <b>{new_val}%</b>{suffix}")
 
@@ -1027,6 +1098,7 @@ async def cmd_depthvol(message: Message) -> None:
         return
     old = depth_min_vol
     depth_min_vol = new_val
+    save_settings()
     suffix = " (off)" if new_val == 0 else ""
     await reply(message, f"✅ Min USD/level: <b>${old:.0f}</b> → <b>${new_val:.0f}</b>{suffix}")
 
@@ -1058,6 +1130,7 @@ async def cmd_mute(message: Message) -> None:
             await reply(message, "❌ Minutes must be a positive number.")
             return
         frozen_symbols[ticker] = time.time() + minutes * 60
+        save_settings()
         display = HARDCODED_SYMBOLS.get(ticker, ticker)
         h, m = int(minutes // 60), int(minutes % 60)
         await reply(message,
@@ -1073,6 +1146,7 @@ async def cmd_mute(message: Message) -> None:
         await reply(message, "❌ Unknown symbol or invalid number.")
         return
     muted_until = time.time() + minutes * 60
+    save_settings()
     h, m = int(minutes // 60), int(minutes % 60)
     await reply(message, f"🔇 <b>Muted for {'{}h {}m'.format(h,m) if h else '{}m'.format(m)}</b>\nUse /unmute to restore.")
 
@@ -1084,6 +1158,7 @@ async def cmd_unmute(message: Message) -> None:
         await reply(message, "ℹ️ Bot is not muted.")
         return
     muted_until = 0.0
+    save_settings()
     await reply(message, "🔊 <b>Alerts restored!</b>")
 
 
@@ -1212,6 +1287,7 @@ async def cmd_ban(message: Message) -> None:
         return
     banned_symbols.add(sym)
     frozen_symbols.pop(sym, None)
+    save_settings()
     await reply(message, f"🔴 <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b> BANNED.")
 
 
@@ -1226,6 +1302,7 @@ async def cmd_unban(message: Message) -> None:
         await reply(message, "❌ Not found or not banned.")
         return
     banned_symbols.discard(sym)
+    save_settings()
     await reply(message, f"✅ <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b> is ACTIVE again.")
 
 
@@ -1247,6 +1324,7 @@ async def cmd_freeze(message: Message) -> None:
         await reply(message, "❌ Minutes must be a positive number.")
         return
     frozen_symbols[sym] = time.time() + minutes * 60
+    save_settings()
     h, m = int(minutes // 60), int(minutes % 60)
     await reply(message, f"🟡 <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b> frozen for <b>{'{}h {}m'.format(h,m) if h else '{}m'.format(m)}</b>.")
 
@@ -1262,6 +1340,7 @@ async def cmd_unfreeze(message: Message) -> None:
         await reply(message, "❌ Not found or not frozen.")
         return
     frozen_symbols.pop(sym)
+    save_settings()
     await reply(message, f"✅ <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b> is ACTIVE again.")
 
 
@@ -1570,6 +1649,9 @@ async def main() -> None:
     )
     dp = Dispatcher()
     dp.include_router(router)
+
+    # Restore tunable settings + ban/freeze/mute state from Upstash
+    load_settings()
 
     me = await bot.get_me()
     logger.info(
