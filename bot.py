@@ -45,6 +45,20 @@ BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing from .env file")
 
+# Optional: post alerts to a supergroup (channel) and/or a forum thread inside it.
+# Leave both unset to fan out alerts to subscriber DMs only.
+def _parse_chat_id(raw: str) -> Optional[int | str]:
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return raw  # e.g. "@channelusername"
+
+CHANNEL_ID: Optional[int | str] = _parse_chat_id(os.getenv("CHANNEL_ID", "") or os.getenv("CHAT_ID", ""))
+THREAD_ID:  Optional[int]       = int(os.getenv("THREAD_ID", "0")) or None
+
 # Tunables (env-overridable, runtime-adjustable via commands)
 flux_pct:        float = float(os.getenv("FLUX_PCT",        "0.15"))
 flux_count:      int   = int(  os.getenv("FLUX_COUNT",      "4"))
@@ -576,10 +590,26 @@ def build_trade_keyboard(symbol: str) -> InlineKeyboardMarkup:
     ]])
 
 
-async def broadcast_alert(bot: Bot, text: str, keyboard: InlineKeyboardMarkup) -> None:
-    """Fan-out an alert to every subscriber's DM with the bot."""
+async def _post_to_channel(bot: Bot, text: str, keyboard: Optional[InlineKeyboardMarkup]) -> bool:
+    """Post once to the configured supergroup/thread. Returns True on success."""
+    if CHANNEL_ID is None:
+        return False
+    try:
+        await bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=text,
+            reply_markup=keyboard,
+            message_thread_id=THREAD_ID,
+        )
+        logger.info("Posted to channel %s thread=%s", CHANNEL_ID, THREAD_ID)
+        return True
+    except Exception as exc:
+        logger.error("Channel post failed (%s thread=%s): %s", CHANNEL_ID, THREAD_ID, exc)
+        return False
+
+
+async def _fanout_to_subscribers(bot: Bot, text: str, keyboard: Optional[InlineKeyboardMarkup]) -> None:
     if not subscribers:
-        logger.info("No subscribers — alert not delivered")
         return
     sent, dead = 0, []
     for chat_id in list(subscribers.keys()):
@@ -597,7 +627,17 @@ async def broadcast_alert(bot: Bot, text: str, keyboard: InlineKeyboardMarkup) -
         subscribers.pop(cid, None)
     if dead:
         save_subscribers()
-    logger.info("Alert fanned out: sent=%d dead=%d", sent, len(dead))
+    logger.info("Fan-out: sent=%d dead=%d", sent, len(dead))
+
+
+async def broadcast_alert(bot: Bot, text: str, keyboard: InlineKeyboardMarkup) -> None:
+    """Channel-first delivery: post to supergroup/thread if configured, else DM subscribers."""
+    if await _post_to_channel(bot, text, keyboard):
+        return
+    if CHANNEL_ID is not None:
+        # Channel configured but post failed — don't double-send to DMs
+        return
+    await _fanout_to_subscribers(bot, text, keyboard)
 
 
 async def send_flux_alert(
@@ -609,14 +649,20 @@ async def send_flux_alert(
     ask1: float,
     bid1_usd: float = 0.0,
     ask1_usd: float = 0.0,
-    is_test: bool = False,
-    chat_id: Optional[int] = None,
+    is_test:   bool          = False,
+    chat_id:   Optional[int] = None,
+    thread_id: Optional[int] = None,
 ) -> None:
     text     = build_flux_message(symbol, count, span, bid1, ask1, bid1_usd, ask1_usd, is_test)
     keyboard = build_trade_keyboard(symbol)
     if chat_id:
         try:
-            await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=keyboard,
+                message_thread_id=thread_id,
+            )
         except Exception as exc:
             logger.error("Test alert failed: %s", exc)
     else:
@@ -856,7 +902,11 @@ async def bootstrap_symbols(session: aiohttp.ClientSession) -> None:
 
 
 async def _notify_subscribers(bot: Bot, text: str) -> None:
-    """Plain DM notification (no inline keyboard) to all subscribers."""
+    """Plain text notification — channel/thread first, fall back to DMs."""
+    if await _post_to_channel(bot, text, None):
+        return
+    if CHANNEL_ID is not None:
+        return
     for chat_id in list(subscribers.keys()):
         try:
             await bot.send_message(chat_id=chat_id, text=text)
@@ -1482,6 +1532,10 @@ async def cmd_settings(message: Message) -> None:
 
     storage = "Upstash ✅" if _upstash_enabled() else f"file (<code>{SUBSCRIBERS_FILE}</code>)"
     ws_tag  = "🟢 connected" if ws_state["connected"] else "🔴 down"
+    if CHANNEL_ID is not None:
+        dest = f"channel <code>{CHANNEL_ID}</code>" + (f" / thread <code>{THREAD_ID}</code>" if THREAD_ID else "")
+    else:
+        dest = f"DM fan-out ({len(subscribers)} subs)"
 
     await reply(message,
         f"⚙️ <b>Applied settings</b>\n\n"
@@ -1494,6 +1548,7 @@ async def cmd_settings(message: Message) -> None:
         f"  • min USD / level:  <b>{vol_str}</b>\n\n"
         f"<b>State</b>\n"
         f"  • alerts:      {mute_str}\n"
+        f"  • destination: {dest}\n"
         f"  • symbols:     <b>{len(MONITORED_SYMBOLS)}</b> watched\n"
         f"  • subscribers: <b>{len(subscribers)}</b>\n"
         f"  • websocket:   {ws_tag}\n"
