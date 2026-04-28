@@ -24,7 +24,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram import F
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -583,13 +583,27 @@ def build_flux_message(
     )
 
 
-def build_trade_keyboard(symbol: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
-            text="📊 MEXC Futures",
-            url=f"https://futures.mexc.com/exchange/{symbol}",
-        )
-    ]])
+def _mexc_button(symbol: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(
+        text="📊 MEXC Futures",
+        url=f"https://futures.mexc.com/exchange/{symbol}",
+    )
+
+
+def build_channel_keyboard(symbol: str) -> InlineKeyboardMarkup:
+    """Channel: just the MEXC link, nothing else."""
+    return InlineKeyboardMarkup(inline_keyboard=[[_mexc_button(symbol)]])
+
+
+def build_admin_keyboard(symbol: str) -> InlineKeyboardMarkup:
+    """Admin DM: MEXC link + ban / mute-1h action buttons."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_mexc_button(symbol)],
+        [
+            InlineKeyboardButton(text="🚫 Ban",     callback_data=f"ban:{symbol}"),
+            InlineKeyboardButton(text="🔇 Mute 1h", callback_data=f"mute1h:{symbol}"),
+        ],
+    ])
 
 
 async def _post_to_channel(bot: Bot, text: str, keyboard: Optional[InlineKeyboardMarkup]) -> bool:
@@ -632,14 +646,21 @@ async def _fanout_to_subscribers(bot: Bot, text: str, keyboard: Optional[InlineK
     logger.info("Fan-out: sent=%d dead=%d", sent, len(dead))
 
 
-async def broadcast_alert(bot: Bot, text: str, keyboard: InlineKeyboardMarkup) -> None:
-    """Channel-first delivery: post to supergroup/thread if configured, else DM subscribers."""
-    if await _post_to_channel(bot, text, keyboard):
-        return
+async def broadcast_alert(bot: Bot, text: str, symbol: str) -> None:
+    """Dual delivery — clean post to the channel + actionable DM to the admin."""
     if CHANNEL_ID is not None:
-        # Channel configured but post failed — don't double-send to DMs
-        return
-    await _fanout_to_subscribers(bot, text, keyboard)
+        await _post_to_channel(bot, text, build_channel_keyboard(symbol))
+
+    # Admin always gets an actionable DM regardless of channel state, so the
+    # ban/mute-1h buttons are always available.
+    try:
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=text,
+            reply_markup=build_admin_keyboard(symbol),
+        )
+    except Exception as exc:
+        logger.warning("Admin DM failed: %s", exc)
 
 
 async def send_flux_alert(
@@ -655,9 +676,11 @@ async def send_flux_alert(
     chat_id:   Optional[int] = None,
     thread_id: Optional[int] = None,
 ) -> None:
-    text     = build_flux_message(symbol, count, span, bid1, ask1, bid1_usd, ask1_usd, is_test)
-    keyboard = build_trade_keyboard(symbol)
+    text = build_flux_message(symbol, count, span, bid1, ask1, bid1_usd, ask1_usd, is_test)
     if chat_id:
+        # /test path: DM the requester. If it's the admin DM, give the action
+        # buttons too so the test exercises the same UI as a real alert.
+        keyboard = build_admin_keyboard(symbol) if chat_id == ADMIN_ID else build_channel_keyboard(symbol)
         try:
             await bot.send_message(
                 chat_id=chat_id,
@@ -668,7 +691,7 @@ async def send_flux_alert(
         except Exception as exc:
             logger.error("Test alert failed: %s", exc)
     else:
-        await broadcast_alert(bot, text, keyboard)
+        await broadcast_alert(bot, text, symbol)
 
 
 # ---------------------------------------------------------------------------
@@ -1749,6 +1772,51 @@ async def cmd_debugflux(message: Message, bot: Bot) -> None:
     )
 
 
+async def _annotate_admin_msg(query: CallbackQuery, suffix: str) -> None:
+    """Append a 'Banned/Muted at HH:MM:SS' footer to the alert and remove its buttons."""
+    if query.message is None:
+        return
+    try:
+        original = query.message.html_text or ""
+        await query.message.edit_text(
+            text=f"{original}\n\n<i>{suffix} — {time.strftime('%H:%M:%S')}</i>",
+            reply_markup=None,
+        )
+    except Exception:
+        pass  # message too old / not editable — toast already confirms
+
+
+@router.callback_query(F.data.startswith(("ban:", "mute1h:")))
+async def cb_action(query: CallbackQuery) -> None:
+    """Inline-button handler for 🚫 Ban and 🔇 Mute 1h on admin DM alerts."""
+    if query.from_user is None or query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Not authorized", show_alert=True)
+        return
+    if not query.data:
+        await query.answer()
+        return
+
+    action, _, sym = query.data.partition(":")
+    if not sym or sym not in MONITORED_SYMBOLS:
+        await query.answer(f"Unknown symbol: {sym}", show_alert=True)
+        return
+
+    display = HARDCODED_SYMBOLS.get(sym, sym)
+    if action == "ban":
+        banned_symbols.add(sym)
+        frozen_symbols.pop(sym, None)
+        save_settings()
+        await query.answer(f"🚫 {display} banned")
+        await _annotate_admin_msg(query, f"🚫 Banned {display}")
+    elif action == "mute1h":
+        frozen_symbols[sym] = time.time() + 3600
+        save_settings()
+        await query.answer(f"🔇 {display} muted 1h")
+        await _annotate_admin_msg(query, f"🔇 Muted {display} 1h")
+    else:
+        await query.answer()
+
+
 @router.message()
 async def cmd_catch_all(message: Message) -> None:
     pass
@@ -1795,7 +1863,7 @@ async def main() -> None:
     automute_task = asyncio.create_task(auto_mute_scheduler(bot))
 
     try:
-        await dp.start_polling(bot, allowed_updates=["message"])
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     finally:
         for t in (ws_task, automute_task):
             t.cancel()
