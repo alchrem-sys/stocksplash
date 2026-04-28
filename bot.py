@@ -176,7 +176,7 @@ HARDCODED_SYMBOLS: dict[str, str] = {
 # Subscriber storage
 # ---------------------------------------------------------------------------
 
-SUBSCRIBERS_FILE = Path(__file__).parent / "subscribers.json"
+SUBSCRIBERS_FILE = Path(os.getenv("SUBSCRIBERS_FILE") or (Path(__file__).parent / "subscribers.json"))
 
 
 def load_subscribers() -> dict[int, dict]:
@@ -191,6 +191,7 @@ def load_subscribers() -> dict[int, dict]:
 
 def save_subscribers() -> None:
     try:
+        SUBSCRIBERS_FILE.parent.mkdir(parents=True, exist_ok=True)
         SUBSCRIBERS_FILE.write_text(json.dumps(subscribers, indent=2))
     except Exception as exc:
         logger.error("Failed to save subscribers: %s", exc)
