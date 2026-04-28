@@ -448,28 +448,30 @@ def _level_usd(symbol: str, price: float, size: float) -> float:
 
 
 def passes_depth_filter(symbol: str, book: DepthBook) -> tuple[bool, str]:
-    """Filter on USD notional + tightness across the top-3 levels both sides."""
+    """Filter on USD notional + top-3 tightness. Each filter is bypassed
+    when its threshold is set to 0."""
     if len(book.bids) < 3 or len(book.asks) < 3:
         return False, f"depth thin (b={len(book.bids)} a={len(book.asks)})"
 
-    for i, lvl in enumerate(book.bids[:3]):
-        usd = _level_usd(symbol, float(lvl[0]), float(lvl[1]))
-        if usd < depth_min_vol:
-            return False, f"bid{i+1} ${usd:.0f} < ${depth_min_vol:.0f}"
-    for i, lvl in enumerate(book.asks[:3]):
-        usd = _level_usd(symbol, float(lvl[0]), float(lvl[1]))
-        if usd < depth_min_vol:
-            return False, f"ask{i+1} ${usd:.0f} < ${depth_min_vol:.0f}"
+    if depth_min_vol > 0:
+        for i, lvl in enumerate(book.bids[:3]):
+            usd = _level_usd(symbol, float(lvl[0]), float(lvl[1]))
+            if usd < depth_min_vol:
+                return False, f"bid{i+1} ${usd:.0f} < ${depth_min_vol:.0f}"
+        for i, lvl in enumerate(book.asks[:3]):
+            usd = _level_usd(symbol, float(lvl[0]), float(lvl[1]))
+            if usd < depth_min_vol:
+                return False, f"ask{i+1} ${usd:.0f} < ${depth_min_vol:.0f}"
 
-    bid1p, bid3p = float(book.bids[0][0]), float(book.bids[2][0])
-    ask1p, ask3p = float(book.asks[0][0]), float(book.asks[2][0])
-    bid_spread = (bid1p - bid3p) / bid1p * 100.0 if bid1p > 0 else 999.0
-    ask_spread = (ask3p - ask1p) / ask1p * 100.0 if ask1p > 0 else 999.0
-
-    if bid_spread > depth_range_pct:
-        return False, f"bid spread {bid_spread:.3f}% > {depth_range_pct:.2f}%"
-    if ask_spread > depth_range_pct:
-        return False, f"ask spread {ask_spread:.3f}% > {depth_range_pct:.2f}%"
+    if depth_range_pct > 0:
+        bid1p, bid3p = float(book.bids[0][0]), float(book.bids[2][0])
+        ask1p, ask3p = float(book.asks[0][0]), float(book.asks[2][0])
+        bid_spread = (bid1p - bid3p) / bid1p * 100.0 if bid1p > 0 else 999.0
+        ask_spread = (ask3p - ask1p) / ask1p * 100.0 if ask1p > 0 else 999.0
+        if bid_spread > depth_range_pct:
+            return False, f"bid spread {bid_spread:.3f}% > {depth_range_pct:.2f}%"
+        if ask_spread > depth_range_pct:
+            return False, f"ask spread {ask_spread:.3f}% > {depth_range_pct:.2f}%"
 
     return True, "ok"
 
@@ -992,18 +994,20 @@ async def cmd_depthrange(message: Message) -> None:
     global depth_range_pct
     args = (message.text or "").split()[1:]
     if not args:
-        await reply(message, f"Top-3 spread cap: <b>{depth_range_pct}%</b>\nUsage: <code>/depthrange 0.20</code>")
+        cur = f"{depth_range_pct}% (off)" if depth_range_pct <= 0 else f"{depth_range_pct}%"
+        await reply(message, f"Top-3 spread cap: <b>{cur}</b>\nUsage: <code>/depthrange 0.20</code>  (set <code>0</code> to disable)")
         return
     try:
         new_val = float(args[0])
-        if new_val <= 0 or new_val > 5:
+        if new_val < 0 or new_val > 100:
             raise ValueError
     except ValueError:
-        await reply(message, "❌ Must be 0.01..5.")
+        await reply(message, "❌ Must be 0..100 (0 disables this filter).")
         return
     old = depth_range_pct
     depth_range_pct = new_val
-    await reply(message, f"✅ Depth range: <b>{old}%</b> → <b>{new_val}%</b>")
+    suffix = " (off)" if new_val == 0 else ""
+    await reply(message, f"✅ Depth range: <b>{old}%</b> → <b>{new_val}%</b>{suffix}")
 
 
 @router.message(Command("depthvol"))
@@ -1011,18 +1015,20 @@ async def cmd_depthvol(message: Message) -> None:
     global depth_min_vol
     args = (message.text or "").split()[1:]
     if not args:
-        await reply(message, f"Min USD per level: <b>${depth_min_vol:.0f}</b>\nUsage: <code>/depthvol 10000</code>  (USD notional)")
+        cur = f"${depth_min_vol:.0f} (off)" if depth_min_vol <= 0 else f"${depth_min_vol:.0f}"
+        await reply(message, f"Min USD per level: <b>{cur}</b>\nUsage: <code>/depthvol 10000</code>  (set <code>0</code> to disable)")
         return
     try:
         new_val = float(args[0])
         if new_val < 0:
             raise ValueError
     except ValueError:
-        await reply(message, "❌ Must be a non-negative number.")
+        await reply(message, "❌ Must be 0 or positive (0 disables this filter).")
         return
     old = depth_min_vol
     depth_min_vol = new_val
-    await reply(message, f"✅ Min USD/level: <b>${old:.0f}</b> → <b>${new_val:.0f}</b>")
+    suffix = " (off)" if new_val == 0 else ""
+    await reply(message, f"✅ Min USD/level: <b>${old:.0f}</b> → <b>${new_val:.0f}</b>{suffix}")
 
 
 @router.message(Command("mute"))
