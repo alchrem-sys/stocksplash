@@ -533,14 +533,16 @@ def passes_depth_filter(symbol: str, book: DepthBook) -> tuple[bool, str]:
         return False, f"depth thin (b={len(book.bids)} a={len(book.asks)})"
 
     if depth_min_vol > 0:
-        for i, lvl in enumerate(book.bids[:3]):
-            usd = _level_usd(symbol, float(lvl[0]), float(lvl[1]))
-            if usd < depth_min_vol:
-                return False, f"bid{i+1} ${usd:.0f} < ${depth_min_vol:.0f}"
-        for i, lvl in enumerate(book.asks[:3]):
-            usd = _level_usd(symbol, float(lvl[0]), float(lvl[1]))
-            if usd < depth_min_vol:
-                return False, f"ask{i+1} ${usd:.0f} < ${depth_min_vol:.0f}"
+        bid_total = sum(
+            _level_usd(symbol, float(l[0]), float(l[1])) for l in book.bids[:3]
+        )
+        ask_total = sum(
+            _level_usd(symbol, float(l[0]), float(l[1])) for l in book.asks[:3]
+        )
+        if bid_total < depth_min_vol:
+            return False, f"bid top-3 ${bid_total:.0f} < ${depth_min_vol:.0f}"
+        if ask_total < depth_min_vol:
+            return False, f"ask top-3 ${ask_total:.0f} < ${depth_min_vol:.0f}"
 
     if depth_range_pct > 0:
         bid1p, bid3p = float(book.bids[0][0]), float(book.bids[2][0])
@@ -1028,7 +1030,7 @@ async def cmd_help(message: Message) -> None:
             "/count 4 — required fluctuations (default 4)\n"
             "/window 60 — rolling window seconds\n"
             "/depthrange 0.20 — max top-3 spread %%\n"
-            "/depthvol 10000 — min USD per level (top-3 each side)\n"
+            "/depthvol 10000 — min USD across top-3 (each side, summed)\n"
             "/debugflux [TICKER] — show why alerts (don't) fire\n"
             "/wsstatus — verify the websocket feed\n"
             "/mute 30 — mute ALL alerts for N minutes\n"
@@ -1062,7 +1064,7 @@ async def cmd_help(message: Message) -> None:
         f"Watches {len(MONITORED_SYMBOLS)} MEXC futures via WebSocket depth.\n"
         f"Each ≥{flux_pct}% move on bid1 OR ask1 = 1 fluctuation.\n"
         f"When {flux_count} fluxes hit within {flux_window}s and the\n"
-        f"orderbook is liquid (top-3 each ≥${depth_min_vol:.0f} USD,\n"
+        f"orderbook is liquid (top-3 sum ≥${depth_min_vol:.0f} USD each side,\n"
         f"top-3 prices within {depth_range_pct}%) → 🚨 alert sent to your DM."
     )
 
@@ -1155,7 +1157,7 @@ async def cmd_depthvol(message: Message) -> None:
     args = (message.text or "").split()[1:]
     if not args:
         cur = f"${depth_min_vol:.0f} (off)" if depth_min_vol <= 0 else f"${depth_min_vol:.0f}"
-        await reply(message, f"Min USD per level: <b>{cur}</b>\nUsage: <code>/depthvol 10000</code>  (set <code>0</code> to disable)")
+        await reply(message, f"Min USD top-3 (each side): <b>{cur}</b>\nUsage: <code>/depthvol 10000</code>  (set <code>0</code> to disable)")
         return
     try:
         new_val = float(args[0])
@@ -1545,7 +1547,7 @@ async def cmd_settings(message: Message) -> None:
         f"  • window:    <b>{flux_window}s</b>\n\n"
         f"<b>Depth filter</b>\n"
         f"  • top-3 spread cap: <b>{range_str}</b>\n"
-        f"  • min USD / level:  <b>{vol_str}</b>\n\n"
+        f"  • min USD top-3 (each side, summed): <b>{vol_str}</b>\n\n"
         f"<b>State</b>\n"
         f"  • alerts:      {mute_str}\n"
         f"  • destination: {dest}\n"
