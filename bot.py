@@ -285,9 +285,10 @@ class DepthBook:
 
 
 MONITORED_SYMBOLS: set[str] = set()
-trackers:    dict[str, FluxTracker] = {}
-depth_books: dict[str, DepthBook]   = {}
-last_alert:  dict[str, float]       = {}
+trackers:        dict[str, FluxTracker] = {}
+depth_books:     dict[str, DepthBook]   = {}
+last_alert:      dict[str, float]       = {}
+contract_sizes:  dict[str, float]       = {}  # symbol → contractSize (e.g. 0.01 for AAPL)
 
 symbols_discovered: bool = False
 banned_symbols: set[str]        = set()
@@ -435,18 +436,25 @@ def update_flux(symbol: str, now: float, bid1: float, ask1: float) -> int:
     return len(tr.events)
 
 
-def passes_depth_filter(book: DepthBook) -> tuple[bool, str]:
-    """All of bid1/2/3 and ask1/2/3 must each have vol ≥ depth_min_vol AND
-    the top-3 prices on each side must span ≤ depth_range_pct%."""
+def _level_usd(symbol: str, price: float, size: float) -> float:
+    """USD notional at one orderbook level: contracts × contractSize × price."""
+    cs = contract_sizes.get(symbol, 1.0)
+    return size * cs * price
+
+
+def passes_depth_filter(symbol: str, book: DepthBook) -> tuple[bool, str]:
+    """Filter on USD notional + tightness across the top-3 levels both sides."""
     if len(book.bids) < 3 or len(book.asks) < 3:
         return False, f"depth thin (b={len(book.bids)} a={len(book.asks)})"
 
     for i, lvl in enumerate(book.bids[:3]):
-        if float(lvl[1]) < depth_min_vol:
-            return False, f"bid{i+1} vol {lvl[1]:.0f} < {depth_min_vol:.0f}"
+        usd = _level_usd(symbol, float(lvl[0]), float(lvl[1]))
+        if usd < depth_min_vol:
+            return False, f"bid{i+1} ${usd:.0f} < ${depth_min_vol:.0f}"
     for i, lvl in enumerate(book.asks[:3]):
-        if float(lvl[1]) < depth_min_vol:
-            return False, f"ask{i+1} vol {lvl[1]:.0f} < {depth_min_vol:.0f}"
+        usd = _level_usd(symbol, float(lvl[0]), float(lvl[1]))
+        if usd < depth_min_vol:
+            return False, f"ask{i+1} ${usd:.0f} < ${depth_min_vol:.0f}"
 
     bid1p, bid3p = float(book.bids[0][0]), float(book.bids[2][0])
     ask1p, ask3p = float(book.asks[0][0]), float(book.asks[2][0])
@@ -579,7 +587,7 @@ async def process_depth_update(bot: Bot, symbol: str, data: dict) -> None:
     if is_muted() and not test_mode:
         return
 
-    passes, reason = passes_depth_filter(book)
+    passes, reason = passes_depth_filter(symbol, book)
     if not passes:
         logger.debug("flux %s blocked by depth filter: %s", symbol, reason)
         return
@@ -698,6 +706,31 @@ async def ws_loop(bot: Bot) -> None:
 # ---------------------------------------------------------------------------
 
 
+async def fetch_contract_sizes(session: aiohttp.ClientSession) -> None:
+    """Populate contract_sizes from /contract/detail. Each contract represents
+    contractSize units of the underlying — needed to convert raw orderbook
+    volumes into USD notional."""
+    try:
+        async with session.get(
+            "https://contract.mexc.com/api/v1/contract/detail",
+            headers=HEADERS,
+            timeout=aiohttp.ClientTimeout(total=15),
+            ssl=True,
+        ) as r:
+            if r.status != 200:
+                logger.warning("contract/detail HTTP %d", r.status)
+                return
+            payload = await r.json(content_type=None)
+            for c in payload.get("data") or []:
+                sym = c.get("symbol")
+                cs  = c.get("contractSize")
+                if sym and cs:
+                    contract_sizes[sym] = float(cs)
+        logger.info("Loaded %d contract sizes", len(contract_sizes))
+    except Exception as exc:
+        logger.error("contract/detail fetch failed: %s", exc)
+
+
 async def bootstrap_symbols(session: aiohttp.ClientSession) -> None:
     global symbols_discovered, MONITORED_SYMBOLS
 
@@ -711,7 +744,13 @@ async def bootstrap_symbols(session: aiohttp.ClientSession) -> None:
     for sym in MONITORED_SYMBOLS:
         trackers[sym]    = FluxTracker()
         depth_books[sym] = DepthBook()
+
+    await fetch_contract_sizes(session)
     symbols_discovered = True
+
+    missing_size = [s for s in MONITORED_SYMBOLS if s not in contract_sizes]
+    if missing_size:
+        logger.warning("No contractSize for: %s", ", ".join(sorted(missing_size)))
 
     logger.info("Bootstrap: %d/%d symbols matched (%d missing)",
                 len(MONITORED_SYMBOLS), len(HARDCODED_SYMBOLS), len(not_found))
@@ -819,7 +858,7 @@ async def cmd_start(message: Message) -> None:
         f"✅ <b>Subscribed!</b>\n"
         f"You'll receive flux alerts here as DMs.\n\n"
         f"⚙️ Default rules: {flux_count}× ≥{flux_pct}% within {flux_window}s, "
-        f"depth ≥{depth_min_vol:.0f} vol on top-3 levels, spread ≤{depth_range_pct}%.\n\n"
+        f"depth ≥${depth_min_vol:.0f} on top-3 levels, spread ≤{depth_range_pct}%.\n\n"
         f"Use /help to see all commands. /stop to unsubscribe."
     )
 
@@ -845,7 +884,7 @@ async def cmd_help(message: Message) -> None:
             "/count 4 — required fluctuations (default 4)\n"
             "/window 60 — rolling window seconds\n"
             "/depthrange 0.20 — max top-3 spread %%\n"
-            "/depthvol 10000 — min volume per level\n"
+            "/depthvol 10000 — min USD per level (top-3 each side)\n"
             "/wsstatus — verify the websocket feed\n"
             "/mute 30 — mute ALL alerts for N minutes\n"
             "/unmute — unmute immediately\n"
@@ -876,7 +915,7 @@ async def cmd_help(message: Message) -> None:
         f"Watches {len(MONITORED_SYMBOLS)} MEXC futures via WebSocket depth.\n"
         f"Each ≥{flux_pct}% move on bid1 OR ask1 = 1 fluctuation.\n"
         f"When {flux_count} fluxes hit within {flux_window}s and the\n"
-        f"orderbook is liquid (top-3 each ≥{depth_min_vol:.0f} vol,\n"
+        f"orderbook is liquid (top-3 each ≥${depth_min_vol:.0f} USD,\n"
         f"top-3 prices within {depth_range_pct}%) → 🚨 alert sent to your DM."
     )
 
@@ -962,7 +1001,7 @@ async def cmd_depthvol(message: Message) -> None:
     global depth_min_vol
     args = (message.text or "").split()[1:]
     if not args:
-        await reply(message, f"Min vol per level: <b>{depth_min_vol:.0f}</b>\nUsage: <code>/depthvol 10000</code>")
+        await reply(message, f"Min USD per level: <b>${depth_min_vol:.0f}</b>\nUsage: <code>/depthvol 10000</code>  (USD notional)")
         return
     try:
         new_val = float(args[0])
@@ -973,7 +1012,7 @@ async def cmd_depthvol(message: Message) -> None:
         return
     old = depth_min_vol
     depth_min_vol = new_val
-    await reply(message, f"✅ Min vol: <b>{old:.0f}</b> → <b>{new_val:.0f}</b>")
+    await reply(message, f"✅ Min USD/level: <b>${old:.0f}</b> → <b>${new_val:.0f}</b>")
 
 
 @router.message(Command("mute"))
@@ -1078,7 +1117,7 @@ async def cmd_status(message: Message) -> None:
         f"📈 With data: <b>{with_data}/{len(MONITORED_SYMBOLS)}</b>\n"
         f"🔕 On cooldown: <b>{on_cooldown}</b>\n"
         f"⚡ Threshold: <b>{flux_pct}%</b>  Count: <b>{flux_count}</b>  Window: <b>{flux_window}s</b>\n"
-        f"📚 Depth filter: top-3 ≥<b>{depth_min_vol:.0f}</b> vol, spread ≤<b>{depth_range_pct}%</b>"
+        f"📚 Depth filter: top-3 ≥<b>${depth_min_vol:.0f}</b> USD, spread ≤<b>{depth_range_pct}%</b>"
         f"{admin_extra}\n\n"
         f"🏆 <b>Most fluctuating now:</b>\n{top_text}"
     )
@@ -1405,7 +1444,7 @@ async def main() -> None:
             bot,
             f"🟢 <b>Flux bot started</b> — {len(MONITORED_SYMBOLS)} symbols, "
             f"{flux_count}× ≥{flux_pct}% / {flux_window}s, "
-            f"depth ≥{depth_min_vol:.0f}/{depth_range_pct}%."
+            f"depth ≥${depth_min_vol:.0f}/{depth_range_pct}%."
         )
 
     ws_task       = asyncio.create_task(ws_loop(bot))
