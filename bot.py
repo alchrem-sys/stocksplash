@@ -587,10 +587,11 @@ async def process_depth_update(bot: Bot, symbol: str, data: dict) -> None:
     if is_muted() and not test_mode:
         return
 
-    passes, reason = passes_depth_filter(symbol, book)
-    if not passes:
-        logger.debug("flux %s blocked by depth filter: %s", symbol, reason)
-        return
+    if not test_mode:
+        passes, reason = passes_depth_filter(symbol, book)
+        if not passes:
+            logger.debug("flux %s blocked by depth filter: %s", symbol, reason)
+            return
 
     tr = trackers[symbol]
     span = (now - tr.events[0]) if tr.events else 0.0
@@ -908,6 +909,7 @@ async def cmd_help(message: Message) -> None:
         "/stop — unsubscribe\n"
         "/status — live stats\n"
         "/symbols — all monitored symbols\n"
+        "/book TICKER — show top-5 bid/ask\n"
         "/wsstatus — websocket health\n"
         "/help — this message"
         f"{admin_section}\n\n"
@@ -1403,8 +1405,56 @@ async def cmd_test(message: Message, bot: Bot) -> None:
     test_chat_id = message.chat.id
     await reply(message,
         "🧪 <b>Test mode armed.</b>\n"
-        f"Will fire on the FIRST ≥{flux_pct}% fluctuation that also passes the depth filter.\n"
+        f"Will fire on the FIRST ≥{flux_pct}% fluctuation — depth/volume filter is "
+        "<b>SKIPPED</b> so you can confirm the bot is alive.\n"
         "Returns to normal afterwards."
+    )
+
+
+@router.message(Command("book"))
+async def cmd_book(message: Message, bot: Bot) -> None:
+    """Show top-5 bid/ask for a symbol — sanity check the WS feed."""
+    args = (message.text or "").split()[1:]
+    if not args:
+        await reply(message, "Usage: <code>/book AAPL</code> or <code>/book AAPLSTOCK_USDT</code>")
+        return
+    sym = find_symbol(args[0])
+    if not sym:
+        await reply(message, f"❌ <code>{args[0].upper()}</code> not in monitored list.")
+        return
+
+    book = depth_books.get(sym)
+    if not book or not book.bids or not book.asks:
+        await reply(message, f"⏳ No book yet for <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b>. WS may still be subscribing.")
+        return
+
+    cs  = contract_sizes.get(sym, 1.0)
+    age = time.time() - book.ts
+
+    def fmt_row(label: str, idx: int, lvl: list) -> Optional[str]:
+        try:
+            price = float(lvl[0])
+            size  = float(lvl[1])
+        except (IndexError, ValueError, TypeError):
+            return None
+        usd = size * cs * price
+        return f"  {label}{idx}  <code>{price}</code>  × <code>{int(size)}</code>  = <b>${usd:,.0f}</b>"
+
+    # Asks: show top→down with ask5 first, ask1 last (closest to bids)
+    ask_rows = [fmt_row("a", i, lvl) for i, lvl in enumerate(book.asks[:5], 1)]
+    ask_rows = [r for r in ask_rows if r]
+    ask_rows.reverse()
+
+    bid_rows = [fmt_row("b", i, lvl) for i, lvl in enumerate(book.bids[:5], 1)]
+    bid_rows = [r for r in bid_rows if r]
+
+    await reply(message,
+        f"📖 <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b>  <code>{sym}</code>\n"
+        f"contractSize: <code>{cs}</code>   age: {age:.1f}s\n\n"
+        f"<b>Asks</b>\n" + ("\n".join(ask_rows) if ask_rows else "  (none)") + "\n"
+        f"   ─────────\n"
+        f"<b>Bids</b>\n" + ("\n".join(bid_rows) if bid_rows else "  (none)") + "\n\n"
+        f"<i>USD = size × contractSize × price</i>"
     )
 
 
