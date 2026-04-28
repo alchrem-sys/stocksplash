@@ -173,13 +173,73 @@ HARDCODED_SYMBOLS: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
-# Subscriber storage
+# Subscriber storage — Upstash Redis (REST) primary, JSON file fallback
 # ---------------------------------------------------------------------------
+
+import urllib.request
+import urllib.error
 
 SUBSCRIBERS_FILE = Path(os.getenv("SUBSCRIBERS_FILE") or (Path(__file__).parent / "subscribers.json"))
 
+UPSTASH_URL   = (os.getenv("UPSTASH_REDIS_REST_URL")   or "").rstrip("/")
+UPSTASH_TOKEN = (os.getenv("UPSTASH_REDIS_REST_TOKEN") or "")
+UPSTASH_KEY   = os.getenv("UPSTASH_SUBS_KEY", "stocksplash:subscribers")
+
+
+def _upstash_enabled() -> bool:
+    return bool(UPSTASH_URL and UPSTASH_TOKEN)
+
+
+def _upstash_command(command: list[str]) -> Optional[dict]:
+    body = json.dumps(command).encode("utf-8")
+    req = urllib.request.Request(
+        UPSTASH_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {UPSTASH_TOKEN}",
+            "Content-Type":  "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as exc:
+        logger.error("Upstash HTTP %s on %s: %s", exc.code, command[0], exc.read()[:200])
+    except Exception as exc:
+        logger.error("Upstash error on %s: %s", command[0], exc)
+    return None
+
+
+def _upstash_load() -> Optional[dict[int, dict]]:
+    resp = _upstash_command(["GET", UPSTASH_KEY])
+    if resp is None:
+        return None
+    val = resp.get("result")
+    if not val:
+        return {}
+    try:
+        data = json.loads(val)
+        return {int(k): v for k, v in data.items()}
+    except Exception as exc:
+        logger.error("Upstash subscribers parse error: %s", exc)
+        return None
+
+
+def _upstash_save() -> bool:
+    payload = json.dumps(subscribers)
+    resp = _upstash_command(["SET", UPSTASH_KEY, payload])
+    return bool(resp and resp.get("result") == "OK")
+
 
 def load_subscribers() -> dict[int, dict]:
+    if _upstash_enabled():
+        data = _upstash_load()
+        if data is not None:
+            logger.info("Loaded %d subscribers from Upstash", len(data))
+            return data
+        logger.warning("Upstash load failed — falling back to local file")
+
     if SUBSCRIBERS_FILE.exists():
         try:
             data = json.loads(SUBSCRIBERS_FILE.read_text())
@@ -190,6 +250,10 @@ def load_subscribers() -> dict[int, dict]:
 
 
 def save_subscribers() -> None:
+    if _upstash_enabled():
+        if _upstash_save():
+            return
+        logger.warning("Upstash save failed — writing to local file as fallback")
     try:
         SUBSCRIBERS_FILE.parent.mkdir(parents=True, exist_ok=True)
         SUBSCRIBERS_FILE.write_text(json.dumps(subscribers, indent=2))
