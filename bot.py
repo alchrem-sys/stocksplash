@@ -65,6 +65,8 @@ flux_count:      int   = int(  os.getenv("FLUX_COUNT",      "4"))
 flux_window:     int   = int(  os.getenv("FLUX_WINDOW",     "60"))
 depth_range_pct: float = float(os.getenv("DEPTH_RANGE_PCT", "0.20"))
 depth_min_vol:   float = float(os.getenv("DEPTH_MIN_VOL",   "10000"))
+spam_max:        int   = int(  os.getenv("SPAM_MAX",        "3"))     # alerts before per-ticker cooldown
+spam_cooldown:   int   = int(  os.getenv("SPAM_COOLDOWN",   "600"))   # seconds of silence after burst
 
 ADMIN_ID = 868931721
 
@@ -357,6 +359,8 @@ class FluxTracker:
     blocks: dict      = field(default_factory=dict)  # reason → count
     last_block:  str  = ""
     last_block_ts: float = 0.0
+    recent_alerts: deque = field(default_factory=deque)  # alert timestamps in cooldown window
+    cooldown_until: float = 0.0   # spam-guard: suppress alerts until this time
 
 
 @dataclass
@@ -649,6 +653,20 @@ async def _fanout_to_subscribers(bot: Bot, text: str, keyboard: Optional[InlineK
     logger.info("Fan-out: sent=%d dead=%d", sent, len(dead))
 
 
+async def _notify_cooldown(bot: Bot, symbol: str) -> None:
+    """One-time admin DM when a ticker hits the spam guard."""
+    display = HARDCODED_SYMBOLS.get(symbol, symbol)
+    minutes = spam_cooldown // 60
+    try:
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"🔇 <b>${display}</b> hit {spam_max}-alert spam guard — "
+                 f"silenced for <b>{minutes}m</b>.",
+        )
+    except Exception as exc:
+        logger.warning("Cooldown DM failed: %s", exc)
+
+
 async def broadcast_alert(bot: Bot, text: str, symbol: str) -> None:
     """Dual delivery — clean post to the channel + actionable DM to the admin."""
     if CHANNEL_ID is not None:
@@ -749,8 +767,25 @@ async def process_depth_update(bot: Bot, symbol: str, data: dict) -> None:
             logger.info("flux %s would-fire but blocked: %s", symbol, reason)
             return
 
+        # Per-ticker spam guard: at most spam_max alerts before a spam_cooldown silence.
+        if now < tr.cooldown_until:
+            tr.blocks["cooldown"] = tr.blocks.get("cooldown", 0) + 1
+            tr.last_block         = f"cooldown {int(tr.cooldown_until - now)}s left"
+            tr.last_block_ts      = now
+            return
+
     span = (now - tr.events[0]) if tr.events else 0.0
     tr.total_alerts += 1
+
+    if not test_mode and spam_max > 0:
+        cutoff = now - spam_cooldown
+        while tr.recent_alerts and tr.recent_alerts[0] < cutoff:
+            tr.recent_alerts.popleft()
+        tr.recent_alerts.append(now)
+        if len(tr.recent_alerts) >= spam_max:
+            tr.cooldown_until = now + spam_cooldown
+            tr.recent_alerts.clear()
+            asyncio.create_task(_notify_cooldown(bot, symbol))
 
     is_test = test_mode
     target_chat = None
@@ -1643,6 +1678,9 @@ async def cmd_settings(message: Message) -> None:
         f"<b>Depth filter</b>\n"
         f"  • top-3 spread cap: <b>{range_str}</b>\n"
         f"  • min USD top-5 (each side, summed): <b>{vol_str}</b>\n\n"
+        f"<b>Spam guard</b>\n"
+        f"  • max alerts before cooldown: <b>{spam_max}</b>\n"
+        f"  • cooldown length: <b>{spam_cooldown // 60}m</b>\n\n"
         f"<b>State</b>\n"
         f"  • alerts:      {mute_str}\n"
         f"  • destination: {dest}\n"
