@@ -4,7 +4,7 @@ Version: 9.0.0 — WS depth-based fluctuation counter
   - Real-time WS feed (sub.depth.full) for sub-second latency
   - Counts ≥0.15% bid1/ask1 moves as fluctuations
   - Alerts when ≥4 fluctuations land within 60s
-  - Filter: bid1/2/3 and ask1/2/3 each ≥ 10k volume,
+  - Filter: top-5 USD notional summed ≥ 10k on each side,
             top-3 prices on each side within 0.20% range
 """
 
@@ -530,22 +530,22 @@ def _level_usd(symbol: str, price: float, size: float) -> float:
 
 
 def passes_depth_filter(symbol: str, book: DepthBook) -> tuple[bool, str]:
-    """Filter on USD notional + top-3 tightness. Each filter is bypassed
-    when its threshold is set to 0."""
-    if len(book.bids) < 3 or len(book.asks) < 3:
+    """Filter on USD notional (top-5 summed) + top-3 spread tightness.
+    Each filter is bypassed when its threshold is set to 0."""
+    if len(book.bids) < 5 or len(book.asks) < 5:
         return False, f"depth thin (b={len(book.bids)} a={len(book.asks)})"
 
     if depth_min_vol > 0:
         bid_total = sum(
-            _level_usd(symbol, float(l[0]), float(l[1])) for l in book.bids[:3]
+            _level_usd(symbol, float(l[0]), float(l[1])) for l in book.bids[:5]
         )
         ask_total = sum(
-            _level_usd(symbol, float(l[0]), float(l[1])) for l in book.asks[:3]
+            _level_usd(symbol, float(l[0]), float(l[1])) for l in book.asks[:5]
         )
         if bid_total < depth_min_vol:
-            return False, f"bid top-3 ${bid_total:.0f} < ${depth_min_vol:.0f}"
+            return False, f"bid top-5 ${bid_total:.0f} < ${depth_min_vol:.0f}"
         if ask_total < depth_min_vol:
-            return False, f"ask top-3 ${ask_total:.0f} < ${depth_min_vol:.0f}"
+            return False, f"ask top-5 ${ask_total:.0f} < ${depth_min_vol:.0f}"
 
     if depth_range_pct > 0:
         bid1p, bid3p = float(book.bids[0][0]), float(book.bids[2][0])
@@ -1099,7 +1099,7 @@ async def cmd_start(message: Message) -> None:
         f"✅ <b>Subscribed!</b>\n"
         f"You'll receive flux alerts here as DMs.\n\n"
         f"⚙️ Default rules: {flux_count}× ≥{flux_pct}% within {flux_window}s, "
-        f"depth ≥${depth_min_vol:.0f} on top-3 levels, spread ≤{depth_range_pct}%.\n\n"
+        f"depth ≥${depth_min_vol:.0f} on top-5 levels, spread ≤{depth_range_pct}%.\n\n"
         f"Use /help to see all commands. /stop to unsubscribe."
     )
 
@@ -1125,7 +1125,7 @@ async def cmd_help(message: Message) -> None:
             "/count 4 — required fluctuations (default 4)\n"
             "/window 60 — rolling window seconds\n"
             "/depthrange 0.20 — max top-3 spread %%\n"
-            "/depthvol 10000 — min USD across top-3 (each side, summed)\n"
+            "/depthvol 10000 — min USD across top-5 (each side, summed)\n"
             "/debugflux [TICKER] — show why alerts (don't) fire\n"
             "/wsstatus — verify the websocket feed\n"
             "/mute 30 — mute ALL alerts for N minutes\n"
@@ -1159,7 +1159,7 @@ async def cmd_help(message: Message) -> None:
         f"Watches {len(MONITORED_SYMBOLS)} MEXC futures via WebSocket depth.\n"
         f"Each ≥{flux_pct}% move on bid1 OR ask1 = 1 fluctuation.\n"
         f"When {flux_count} fluxes hit within {flux_window}s and the\n"
-        f"orderbook is liquid (top-3 sum ≥${depth_min_vol:.0f} USD each side,\n"
+        f"orderbook is liquid (top-5 sum ≥${depth_min_vol:.0f} USD each side,\n"
         f"top-3 prices within {depth_range_pct}%) → 🚨 alert sent to your DM."
     )
 
@@ -1252,7 +1252,7 @@ async def cmd_depthvol(message: Message) -> None:
     args = (message.text or "").split()[1:]
     if not args:
         cur = f"${depth_min_vol:.0f} (off)" if depth_min_vol <= 0 else f"${depth_min_vol:.0f}"
-        await reply(message, f"Min USD top-3 (each side): <b>{cur}</b>\nUsage: <code>/depthvol 10000</code>  (set <code>0</code> to disable)")
+        await reply(message, f"Min USD top-5 (each side): <b>{cur}</b>\nUsage: <code>/depthvol 10000</code>  (set <code>0</code> to disable)")
         return
     try:
         new_val = float(args[0])
@@ -1368,7 +1368,7 @@ async def cmd_status(message: Message) -> None:
         f"🔍 Symbols watched: <b>{len(MONITORED_SYMBOLS)}</b>\n"
         f"📈 With data: <b>{with_data}/{len(MONITORED_SYMBOLS)}</b>\n"
         f"⚡ Threshold: <b>{flux_pct}%</b>  Count: <b>{flux_count}</b>  Window: <b>{flux_window}s</b>\n"
-        f"📚 Depth filter: top-3 ≥<b>${depth_min_vol:.0f}</b> USD, spread ≤<b>{depth_range_pct}%</b>"
+        f"📚 Depth filter: top-5 ≥<b>${depth_min_vol:.0f}</b> USD, spread ≤<b>{depth_range_pct}%</b>"
         f"{admin_extra}\n\n"
         f"🏆 <b>Most fluctuating now:</b>\n{top_text}"
     )
@@ -1642,7 +1642,7 @@ async def cmd_settings(message: Message) -> None:
         f"  • window:    <b>{flux_window}s</b>\n\n"
         f"<b>Depth filter</b>\n"
         f"  • top-3 spread cap: <b>{range_str}</b>\n"
-        f"  • min USD top-3 (each side, summed): <b>{vol_str}</b>\n\n"
+        f"  • min USD top-5 (each side, summed): <b>{vol_str}</b>\n\n"
         f"<b>State</b>\n"
         f"  • alerts:      {mute_str}\n"
         f"  • destination: {dest}\n"
@@ -1785,16 +1785,16 @@ async def cmd_debugflux(message: Message, bot: Bot) -> None:
         book_line = ""
         if book and book.bids and book.asks:
             cs = contract_sizes.get(sym, 1.0)
-            b_usds = [_level_usd(sym, float(l[0]), float(l[1])) for l in book.bids[:3]]
-            a_usds = [_level_usd(sym, float(l[0]), float(l[1])) for l in book.asks[:3]]
+            b_usds = [_level_usd(sym, float(l[0]), float(l[1])) for l in book.bids[:5]]
+            a_usds = [_level_usd(sym, float(l[0]), float(l[1])) for l in book.asks[:5]]
             bid1, bid3 = float(book.bids[0][0]), float(book.bids[2][0])
             ask1, ask3 = float(book.asks[0][0]), float(book.asks[2][0])
             b_spread = (bid1 - bid3) / bid1 * 100 if bid1 else 0
             a_spread = (ask3 - ask1) / ask1 * 100 if ask1 else 0
             book_line = (
-                f"\n<b>Live book (top-3 USD)</b>\n"
-                f"  bid: " + " / ".join(f"${u:,.0f}" for u in b_usds) + f"   spread {b_spread:.3f}%\n"
-                f"  ask: " + " / ".join(f"${u:,.0f}" for u in a_usds) + f"   spread {a_spread:.3f}%"
+                f"\n<b>Live book (top-5 USD, spread top-3)</b>\n"
+                f"  bid: " + " / ".join(f"${u:,.0f}" for u in b_usds) + f"   Σ ${sum(b_usds):,.0f}   spread {b_spread:.3f}%\n"
+                f"  ask: " + " / ".join(f"${u:,.0f}" for u in a_usds) + f"   Σ ${sum(a_usds):,.0f}   spread {a_spread:.3f}%"
             )
         await reply(message,
             f"🔬 <b>{HARDCODED_SYMBOLS.get(sym, sym)}</b>  <code>{sym}</code>\n"
